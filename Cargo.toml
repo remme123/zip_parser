@@ -1,0 +1,16 @@
+[package]
+name = "zip_parser"
+version = "0.1.0"
+edition = "2018"
+
+[features]
+default = []
+std = []
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[[example]]
+name = "parse_zip_file"
+required-features = ["std"]
