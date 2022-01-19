@@ -141,15 +141,6 @@ impl LocalFileHeader {
         })
     }
 
-    pub unsafe fn get_file_name<'a>(&self) -> &'a str {
-        let base = self as *const Self as *const u8;
-        let b = slice::from_raw_parts(
-            base.offset(mem::size_of::<Self>() as isize),
-            self.file_name_length as usize,
-        );
-        str::from_utf8_unchecked(b)
-    }
-
     pub unsafe fn get_extra_field(&self) -> &[u8] {
         let base = self as *const Self as *const u8;
         slice::from_raw_parts(
@@ -204,15 +195,6 @@ impl CentralFileHeader {
                 None
             }
         })
-    }
-
-    pub unsafe fn get_file_name<'a>(&self) -> &'a str {
-        let base = self as *const Self as *const u8;
-        let b = slice::from_raw_parts(
-            base.offset(mem::size_of::<Self>() as isize),
-            self.file_name_length as usize,
-        );
-        str::from_utf8_unchecked(b)
     }
 
     pub unsafe fn get_extra_field(&self) -> &[u8] {
@@ -358,12 +340,14 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
 // }
 
 pub struct Parser<S: Read + Seek> {
-    pub number_of_files: usize,
+    /// It will be None when no central directory was found
+    pub number_of_files: Option<usize>,
 
     central_directory_offset: u64,
     /// offset relative to the central dir
     next_entry_offset: u64,
 
+    /// holding the file handle
     stream: S,
     seek_available: bool,
     stream_len: u64,
@@ -375,7 +359,7 @@ impl<S: Read + Seek> Parser<S> {
         let mut seek_available = false;
         let mut stream_len = 0u64;
         let mut central_directory_offset = 0u64;
-        let mut number_of_files: usize = 0;
+        let mut number_of_files = None;
         if let Some(len) = stream.stream_len() {
             stream_len = len;
             const READ_LEN: usize = mem::size_of::<CentralDirEnd>();
@@ -387,7 +371,7 @@ impl<S: Read + Seek> Parser<S> {
                         let _ = stream.seek(SeekFrom::Start(central_dir.central_directory_offset as u64));
                         seek_available = true;
                         central_directory_offset = central_dir.central_directory_offset.into();
-                        number_of_files = central_dir.total_entries_this_disk.into();
+                        number_of_files = Some(central_dir.total_entries_this_disk.into());
                     } else {
                         let _ = stream.rewind();
                     }
@@ -457,12 +441,13 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
                         if matches!(self.stream.read(&mut local_header_buf), Ok(n) if n == local_header_buf.len()) {
                             if let Some(local_header) = unsafe { LocalFileHeader::from_raw_ptr(&local_header_buf) } {
                                 let data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
-                                #[cfg(feature = "std")]
                                 if file.file_data_offset != data_offset {
-                                    eprintln!("file header len does not match(central <-> local): {} != {}",
-                                              file.file_data_offset, data_offset);
-                                    eprintln!("in central header: {:02X?}", &file_info);
-                                    eprintln!("in lcoal header: {:02X?}", &local_header);
+                                    #[cfg(feature = "std")] {
+                                        eprintln!("file header len does not match(central <-> local): {} != {}",
+                                                  file.file_data_offset, data_offset);
+                                        eprintln!("in central header: {:02X?}", &file_info);
+                                        eprintln!("in lcoal header: {:02X?}", &local_header);
+                                    }
                                     file.file_data_offset = data_offset;
                                 }
                                 Some(file)
@@ -509,43 +494,5 @@ mod tests {
 
     #[test]
     fn parse_file_list() {
-        let mut buf = Vec::new();
-        if let Ok(_n) = File::open("test.zip").and_then(|mut f| f.read_to_end(&mut buf)) {
-            println!("{:02X?}", buf);
-            let mut buf = buf.as_mut_slice();
-            while buf.len() > 4 {
-                match [buf[0], buf[1], buf[2], buf[3]].into() {
-                    Signature::LocalFileHeader => {
-                        let header = unsafe { LocalFileHeader::from_raw_ptr(buf).unwrap() };
-                        println!("{:#X?}", header);
-                        unsafe {
-                            dbg!(header.get_file_name());
-                        }
-                        let len = header.len() + header.compressed_size as usize;
-                        buf = &mut buf[len..];
-                    }
-                    Signature::CentralFileHeader => {
-                        let header = unsafe { CentralFileHeader::from_raw_ptr(buf).unwrap() };
-                        println!("{:#X?}", header);
-                        unsafe {
-                            dbg!(header.get_file_name());
-                            dbg!(header.get_file_comment());
-                        }
-                        let len = header.len();
-                        buf = &mut buf[len..];
-                    }
-                    Signature::CentralDirEnd => {
-                        let header = unsafe { CentralDirEnd::from_raw_ptr(buf).unwrap() };
-                        println!("{:#X?}", header);
-                        let len = header.len();
-                        buf = &mut buf[len..];
-                    }
-                    Signature::Unknown => {
-                        eprintln!("unknown signature: {:02X?}", &buf[0..4]);
-                        break;
-                    }
-                }
-            }
-        }
     }
 }
