@@ -10,7 +10,7 @@ fn main() {
     }
     let file = File::open(args[1].as_str()).unwrap();
     for (i, mut file) in Parser::new(file).enumerate() {
-        println!("{}: {}: {:02X?}", i, unsafe { file.file_name() }, file);
+        println!("{}: {}({} Bytes): {:02X?}", i, unsafe { file.file_name() }, file.file_size(), file);
         let mut buf = [0u8; 16];
         if let Ok(n) = file.read(&mut buf) {
             println!("Data: {:02X?}", &buf[..n]);

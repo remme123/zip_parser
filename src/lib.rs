@@ -314,6 +314,10 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
         str::from_utf8_unchecked(&self.file_name[..self.file_name_length])
     }
 
+    pub fn file_size(&self) -> u64 {
+        self.compressed_size
+    }
+
     pub fn read(&mut self, buf: &mut [u8]) -> ReadResult {
         self.stream.read(buf)
     }
@@ -323,19 +327,6 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
 // impl<'a, S: Read + Seek> io::Read for LocalFile<'a, S> {
 //     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 //         todo!()
-//     }
-// }
-
-// impl<S:  Read + Seek> Default for LocalFile<S> {
-//     fn default() -> Self {
-//         LocalFile {
-//             file_name: [0; 128],
-//             file_name_length: 0,
-//
-//             compression_method: 0,
-//             compressed_size: 0,
-//             uncompressed_size: 0,
-//         }
 //     }
 // }
 
