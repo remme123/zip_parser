@@ -14,3 +14,7 @@ std = []
 [[example]]
 name = "parse_zip_file"
 required-features = ["std"]
+
+[[example]]
+name = "stream_parsing"
+required-features = ["std"]

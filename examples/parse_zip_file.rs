@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::File;
+use std::io::Read;
 
 use zip_parser::*;
 
@@ -17,5 +18,6 @@ fn main() {
         } else {
             println!("read failed");
         }
+        println!();
     }
 }

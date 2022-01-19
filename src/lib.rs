@@ -11,7 +11,8 @@ use core::ops::{Deref, DerefMut};
 #[cfg(feature = "std")]
 use std::{io, fs};
 
-type ReadResult<'a> = Result<usize, &'a str>;
+pub type ReadResult<'a> = Result<usize, &'a str>;
+
 pub trait Read {
     fn read(&mut self, buf: &mut [u8]) -> ReadResult;
 }
@@ -369,6 +370,9 @@ impl<S: Read + Seek> Parser<S> {
                 } else {
                     let _ = stream.rewind();
                 }
+            } else {
+                #[cfg(feature = "std")]
+                eprintln!("seek is unavailable");
             }
         } else {
             #[cfg(feature = "std")]
@@ -395,6 +399,7 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.seek_available {
+            // seek read
             let _ = self.stream.seek(SeekFrom::Start(self.central_directory_offset + self.next_entry_offset));
             let mut buf = [0u8; mem::size_of::<CentralFileHeader>()];
             match self.stream.read(&mut buf) {
@@ -405,7 +410,7 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
                         let mut file = LocalFile {
                             file_name: [0; 128],
                             file_name_length: 0,
-                            file_data_offset: file_info.relative_offset_of_local_header as u64 + file_info.local_header_len() as u64,
+                            file_data_offset: 0,
                             compression_method: file_info.compression_method,
                             compressed_size: file_info.compressed_size as u64,
                             uncompressed_size: file_info.uncompressed_size as u64,
@@ -428,19 +433,9 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
                         // seek to file data
                         let mut local_header_buf = [0u8; mem::size_of::<LocalFileHeader>()];
                         let _ = self.stream.seek(SeekFrom::Start(file_info.relative_offset_of_local_header as u64));
-
                         if matches!(self.stream.read(&mut local_header_buf), Ok(n) if n == local_header_buf.len()) {
                             if let Some(local_header) = unsafe { LocalFileHeader::from_raw_ptr(&local_header_buf) } {
-                                let data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
-                                if file.file_data_offset != data_offset {
-                                    #[cfg(feature = "std")] {
-                                        eprintln!("file header len does not match(central <-> local): {} != {}",
-                                                  file.file_data_offset, data_offset);
-                                        eprintln!("in central header: {:02X?}", &file_info);
-                                        eprintln!("in lcoal header: {:02X?}", &local_header);
-                                    }
-                                    file.file_data_offset = data_offset;
-                                }
+                                file.file_data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
                                 Some(file)
                             } else {
                                 #[cfg(feature = "std")]
@@ -470,8 +465,60 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
                 }
             }
         } else {
-            todo!();
-            None
+            // sequential read
+            let mut buf = [0u8; mem::size_of::<LocalFileHeader>()];
+            if matches!(self.stream.read(&mut buf), Ok(n) if n == buf.len()) {
+                if let Some(file_info) = unsafe { LocalFileHeader::from_raw_ptr(&buf) } {
+                    #[cfg(feature = "std")]
+                    dbg!(file_info);
+                    let mut file = LocalFile {
+                        file_name: [0; 128],
+                        file_name_length: 0,
+                        file_data_offset: 0,
+                        compression_method: file_info.compression_method,
+                        compressed_size: file_info.compressed_size as u64,
+                        uncompressed_size: file_info.uncompressed_size as u64,
+                        stream: ZipFileStream {
+                            stream: &mut self.stream,
+                            stream_len: self.stream_len,
+                            seek_available: self.seek_available,
+                            _marker: PhantomData,
+                        }
+                    };
+                    file.file_name_length = self
+                        .stream
+                        .read(&mut file.file_name[..file_info.file_name_length as usize]).unwrap_or(0);
+
+                    // drop data unprocessed
+                    {
+                        let mut len = file_info.extra_field_length as usize;
+                        let mut buf = [0u8; 16];
+                        loop {
+                            let read_len = if len > 16 { 16 } else { len };
+                            if let Ok(n) = self.stream.read(&mut buf[..read_len]) {
+                                len -= n;
+                                if len == 0 {
+                                    break;
+                                }
+                            } else {
+                                #[cfg(feature = "std")]
+                                eprintln!("drop data read failed");
+                                return None;
+                            }
+                        }
+                    }
+
+                    Some(file)
+                } else {
+                    #[cfg(feature = "std")]
+                    eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", buf);
+                    None
+                }
+            } else {
+                #[cfg(feature = "std")]
+                eprintln!("read local header failed");
+                None
+            }
         }
     }
 }
