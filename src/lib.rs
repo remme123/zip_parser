@@ -1,3 +1,4 @@
+#![feature(specialization)]
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 use core::fmt::{Display, Formatter};
@@ -45,27 +46,33 @@ impl Into<io::SeekFrom> for SeekFrom {
 }
 
 pub trait Seek {
-    fn seek(&mut self, _pos: SeekFrom) -> Result<u64, &str> {
+    fn seek(&mut self, _pos: SeekFrom) -> Result<u64, &str>;
+
+    fn rewind(&mut self) -> Result<(), &str>;
+
+    fn stream_len(&mut self) -> Option<u64>;
+}
+
+impl<T> Seek for T {
+    default fn seek(&mut self, _pos: SeekFrom) -> Result<u64, &str> {
         Err("unimplemented")
     }
 
-    fn rewind(&mut self) -> Result<(), &str> {
+    default fn rewind(&mut self) -> Result<(), &str> {
         if self.seek(SeekFrom::Start(0)).is_ok() {
             Ok(())
         } else {
-            Err("seek to beginning failed")
+            Err("seek to the beginning failed")
         }
     }
 
-    fn stream_len(&mut self) -> Option<u64> {
+    default fn stream_len(&mut self) -> Option<u64> {
         None
     }
 }
 
 #[cfg(feature = "std")]
-impl<T> Seek for T
-where
-    T: io::Seek,
+impl<T: io::Seek> Seek for T
 {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, &str> {
         self.seek(pos.into()).or(Err("std.io.seek err"))
@@ -261,8 +268,6 @@ impl CentralDirEnd {
 #[derive(Debug)]
 struct ZipFileStream<'a, S: Read + Seek> {
     stream: *mut S,
-    seek_available: bool,
-    stream_len: u64,
 
      _marker: PhantomData<&'a S>
 }
@@ -307,7 +312,8 @@ pub struct LocalFile<'a, S: Read + Seek> {
     pub compressed_size: u64,
     pub uncompressed_size: u64,
 
-    stream: ZipFileStream<'a, S>,
+    stream: *mut S,
+    _marker: PhantomData<&'a mut S>,
 }
 
 impl<'a, S: Read + Seek> LocalFile<'a, S> {
@@ -320,7 +326,9 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> ReadResult {
-        self.stream.read(buf)
+        unsafe {
+            self.stream.as_mut().unwrap().read(buf)
+        }
     }
 }
 
@@ -331,7 +339,7 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
 //     }
 // }
 
-pub struct Parser<S: Read + Seek> {
+pub struct Parser<'a, S: Read + Seek> {
     /// It will be None when no central directory was found
     pub number_of_files: Option<usize>,
 
@@ -343,9 +351,11 @@ pub struct Parser<S: Read + Seek> {
     stream: S,
     seek_available: bool,
     stream_len: u64,
+
+    _marker: PhantomData<&'a S>,
 }
 
-impl<S: Read + Seek> Parser<S> {
+impl<'a, S: Read + Seek> Parser<'a, S> {
     pub fn new(mut stream: S) -> Self {
         // seek to the start of central directory
         let mut seek_available = false;
@@ -386,6 +396,7 @@ impl<S: Read + Seek> Parser<S> {
             central_directory_offset,
             next_entry_offset: 0,
             number_of_files,
+            _marker: PhantomData,
         }
     }
 }
@@ -394,13 +405,15 @@ pub struct Iter<'a, S: Read + Seek> {
     stream: ZipFileStream<'a, S>,
 }
 
-impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
+impl<'a, S: Read + Seek> Iterator for Parser<'a, S> {
     type Item = LocalFile<'a, S>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.seek_available {
             // seek read
-            let _ = self.stream.seek(SeekFrom::Start(self.central_directory_offset + self.next_entry_offset));
+            let _ = self.stream.seek(
+                SeekFrom::Start(self.central_directory_offset + self.next_entry_offset)
+            );
             let mut buf = [0u8; mem::size_of::<CentralFileHeader>()];
             match self.stream.read(&mut buf) {
                 Ok(n) if n == buf.len() => {
@@ -414,12 +427,8 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
                             compression_method: file_info.compression_method,
                             compressed_size: file_info.compressed_size as u64,
                             uncompressed_size: file_info.uncompressed_size as u64,
-                            stream: ZipFileStream {
-                                stream: &mut self.stream,
-                                stream_len: self.stream_len,
-                                seek_available: self.seek_available,
-                                _marker: PhantomData,
-                            }
+                            stream: &mut self.stream,
+                            _marker: PhantomData,
                         };
                         if let Ok(n) = self
                             .stream
@@ -478,12 +487,8 @@ impl<'a, S: Read + Seek> Iterator for &'a mut Parser<S> {
                         compression_method: file_info.compression_method,
                         compressed_size: file_info.compressed_size as u64,
                         uncompressed_size: file_info.uncompressed_size as u64,
-                        stream: ZipFileStream {
-                            stream: &mut self.stream,
-                            stream_len: self.stream_len,
-                            seek_available: self.seek_available,
-                            _marker: PhantomData,
-                        }
+                        stream: &mut self.stream,
+                        _marker: PhantomData,
                     };
                     file.file_name_length = self
                         .stream

@@ -1,8 +1,28 @@
 use std::env;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, stdin};
 
-use zip_parser::*;
+use zip_parser as zip;
+use zip::*;
+
+fn parse<S: zip::Read + zip::Seek>(mut parser: Parser<S>) {
+    for (i, mut file) in parser.enumerate() {
+        println!("{}: {}({} Bytes)", i, unsafe { file.file_name() }, file.file_size());
+        let mut buf = Vec::new();
+        buf.resize(file.file_size() as usize, 0);
+        if let Ok(n) = file.read(&mut buf) {
+            println!("Data: {:02X?}", &buf[..n]);
+        } else {
+            println!("read failed");
+        }
+        println!();
+    }
+}
+
+fn stdin_parsing() {
+    println!("*** get stream from stdin ***");
+    parse(Parser::new(stdin().lock()))
+}
 
 #[derive(Debug)]
 struct DataBuffer {
@@ -28,13 +48,11 @@ impl zip_parser::Read for DataBuffer {
     }
 }
 
-impl zip_parser::Seek for DataBuffer {
-}
-
-fn main() {
+fn file_parsing() {
+    println!("*** get stream from file ***");
     let args: Vec<_> = env::args().collect();
     if args.len() < 2 {
-        panic!("no zip file specified")
+        panic!("specify zip file path")
     }
     let mut file = File::open(args[1].as_str()).unwrap();
     let mut buffer = DataBuffer {
@@ -43,15 +61,9 @@ fn main() {
     };
     let file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
 
-    for (i, mut file) in Parser::new(buffer).enumerate() {
-        println!("{}: {}({} Bytes): {:02X?}", i, unsafe { file.file_name() }, file.file_size(), file);
-        let mut buf = Vec::new();
-        buf.resize(file.file_size() as usize, 0);
-        if let Ok(n) = file.read(&mut buf) {
-            println!("Data: {:02X?}", &buf[..n]);
-        } else {
-            println!("read failed");
-        }
-        println!();
-    }
+    parse(Parser::new(buffer))
+}
+
+fn main() {
+    stdin_parsing();
 }
