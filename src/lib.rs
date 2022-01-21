@@ -4,24 +4,38 @@
 use core::fmt::{Display, Formatter};
 use core::mem;
 use core::ptr;
-use core::slice;
+use core::slice::{self, Iter};
 use core::str;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
+use core::convert::{From, TryFrom};
 
 #[cfg(feature = "std")]
 use std::{io, fs};
 
-pub type ReadResult<'a> = Result<usize, &'a str>;
+pub type ReadResult = Result<usize, &'static str>;
 
 pub trait Read {
     fn read(&mut self, buf: &mut [u8]) -> ReadResult;
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), &'static str> {
+        let mut i = 0;
+        while i < buf.len() {
+            match self.read(&mut buf[i..]) {
+                Ok(n) => {
+                    i += n;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "std")]
-impl<T> Read for T
-where
-    T: io::Read,
+impl<T> Read for T where T: io::Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> ReadResult {
         self.read(buf).or(Err("std.io.read err"))
@@ -115,6 +129,17 @@ impl From<u32> for Signature {
 impl From<[u8; 4]> for Signature {
     fn from(value: [u8; 4]) -> Self {
         u32::from_le_bytes([value[0], value[1], value[2], value[3]]).into()
+    }
+}
+
+impl TryFrom<&[u8]> for Signature {
+    type Error = &'static str;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() < 4 {
+            return Err("no enough data");
+        }
+        Ok([value[0], value[1], value[2], value[3]].into())
     }
 }
 
@@ -330,6 +355,12 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
             self.stream.as_mut().unwrap().read(buf)
         }
     }
+
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), &'static str> {
+        unsafe {
+            self.stream.as_mut().unwrap().read_exact(buf)
+        }
+    }
 }
 
 // #[cfg(feature = "std")]
@@ -351,6 +382,10 @@ pub struct Parser<'a, S: Read + Seek> {
     stream: S,
     seek_available: bool,
     stream_len: u64,
+
+    /// signature buffer
+    buffer: [u8; mem::size_of::<LocalFileHeader>()],
+    data_len_in_buffer: usize,
 
     _marker: PhantomData<&'a S>,
 }
@@ -396,13 +431,11 @@ impl<'a, S: Read + Seek> Parser<'a, S> {
             central_directory_offset,
             next_entry_offset: 0,
             number_of_files,
+            buffer: [0; mem::size_of::<LocalFileHeader>()],
+            data_len_in_buffer: 0,
             _marker: PhantomData,
         }
     }
-}
-
-pub struct Iter<'a, S: Read + Seek> {
-    stream: ZipFileStream<'a, S>,
 }
 
 impl<'a, S: Read + Seek> Iterator for Parser<'a, S> {
@@ -475,53 +508,105 @@ impl<'a, S: Read + Seek> Iterator for Parser<'a, S> {
             }
         } else {
             // sequential read
-            let mut buf = [0u8; mem::size_of::<LocalFileHeader>()];
-            if matches!(self.stream.read(&mut buf), Ok(n) if n == buf.len()) {
-                if let Some(file_info) = unsafe { LocalFileHeader::from_raw_ptr(&buf) } {
-                    #[cfg(feature = "std")]
-                    dbg!(file_info);
-                    let mut file = LocalFile {
-                        file_name: [0; 128],
-                        file_name_length: 0,
-                        file_data_offset: 0,
-                        compression_method: file_info.compression_method,
-                        compressed_size: file_info.compressed_size as u64,
-                        uncompressed_size: file_info.uncompressed_size as u64,
-                        stream: &mut self.stream,
-                        _marker: PhantomData,
-                    };
-                    file.file_name_length = self
-                        .stream
-                        .read(&mut file.file_name[..file_info.file_name_length as usize]).unwrap_or(0);
-
-                    // drop data unprocessed
-                    {
-                        let mut len = file_info.extra_field_length as usize;
-                        let mut buf = [0u8; 16];
-                        loop {
-                            let read_len = if len > 16 { 16 } else { len };
-                            if let Ok(n) = self.stream.read(&mut buf[..read_len]) {
-                                len -= n;
-                                if len == 0 {
-                                    break;
-                                }
-                            } else {
-                                #[cfg(feature = "std")]
-                                eprintln!("drop data read failed");
-                                return None;
-                            }
-                        }
+            loop {
+                // read enough data
+                let read_len = self.buffer.len() - self.data_len_in_buffer;
+                if let Ok(n) = self.stream.read(&mut self.buffer[self.data_len_in_buffer..]) {
+                    if n == 0 {
+                        return None;
+                    } else if n < read_len {
+                        self.data_len_in_buffer += n;
+                        continue;
+                    } else {
+                        self.data_len_in_buffer += n;
                     }
-
-                    Some(file)
                 } else {
                     #[cfg(feature = "std")]
-                    eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", buf);
-                    None
+                    eprintln!("read local header failed");
+                    return None;
                 }
+
+                // search LocalFileHeader
+                // search signature
+                let mut header_found = false;
+                for (i, _v) in self.buffer.iter().take(self.data_len_in_buffer - 3).enumerate() {
+                    if self.buffer[i..i+4] == [0x50, 0x4b, 0x03, 0x04] {
+                        unsafe {
+                            let len = self.data_len_in_buffer - i;
+                            ptr::copy(self.buffer.as_ptr().offset(i as isize),
+                                      self.buffer.as_mut_ptr(),
+                                      len);
+                            self.data_len_in_buffer = len;
+                            header_found = true;
+                        }
+                        #[cfg(feature = "std")]
+                        println!("found signature at {}", i);
+                        break;
+                    }
+                }
+                // save the last 3 bytes if header was not found
+                if header_found == false {
+                    for i in 0..3 {
+                        self.buffer[i] = self.buffer[self.data_len_in_buffer - 3 + i];
+                    }
+                    self.data_len_in_buffer = 3;
+                    continue;
+                }
+
+                // begin to parse if data is ready
+                if self.data_len_in_buffer == self.buffer.len() {
+                    break;
+                }
+            }
+
+            // parse header
+            if let Some(file_info) = unsafe { LocalFileHeader::from_raw_ptr(&self.buffer) } {
+                #[cfg(feature = "std")]
+                dbg!(file_info);
+                let mut file = LocalFile {
+                    file_name: [0; 128],
+                    file_name_length: 0,
+                    file_data_offset: 0,
+                    compression_method: file_info.compression_method,
+                    compressed_size: file_info.compressed_size as u64,
+                    uncompressed_size: file_info.uncompressed_size as u64,
+                    stream: &mut self.stream,
+                    _marker: PhantomData,
+                };
+                match self.stream.read_exact(&mut file.file_name[..file_info.file_name_length as usize]) {
+                    Ok(_) => file.file_name_length = file_info.file_name_length as usize,
+                    Err(e) => {
+                        #[cfg(feature = "std")]
+                        eprintln!("read filename failed: {}", e);
+                    },
+                }
+
+                // drop data unprocessed
+                {
+                    let mut len = file_info.extra_field_length as usize;
+                    let mut buf = [0u8; 16];
+                    loop {
+                        let read_len = if len > 16 { 16 } else { len };
+                        if let Ok(n) = self.stream.read(&mut buf[..read_len]) {
+                            len -= n;
+                            if len == 0 {
+                                break;
+                            }
+                        } else {
+                            #[cfg(feature = "std")]
+                            eprintln!("drop data read failed");
+                            return None;
+                        }
+                    }
+                }
+
+                // reset for next header
+                self.data_len_in_buffer = 0;
+
+                Some(file)
             } else {
                 #[cfg(feature = "std")]
-                eprintln!("read local header failed");
+                eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", self.buffer);
                 None
             }
         }
