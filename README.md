@@ -25,3 +25,18 @@ fn stdin_parsing() {
 }
 ```
 You just need to pass a stream which implements `Read` into the `Parser::new()`, then you can iterate over it. For more detail, see example `stream_parsing`
+
+## example
+### stream_parsing
+1. from `stdin`
+    ```bash
+    cat test.zip | cargo run --features="std" --example stream_parsing
+    ```
+    or even you can cat multiple zip files:
+    ```bash
+    cat test.zip test.zip | cargo run --features="std" --example stream_parsing
+    ```
+1. from file
+    ```bash
+    cargo run --features="std" --example stream_parsing -- test.zip
+    ```
