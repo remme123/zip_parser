@@ -2,6 +2,10 @@
 name = "zip_parser"
 version = "0.1.0"
 edition = "2018"
+license = "MIT"
+repository = "https://github.com/remme123/zip_parser"
+keywords = ["zip", "parser", "no_std", "stream"]
+description = "A zip file format parser, supporting no_std environment, stream parsing, seeking."
 
 [features]
 default = []

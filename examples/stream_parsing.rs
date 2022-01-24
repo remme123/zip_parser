@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::{Read, stdin};
 
 use zip_parser as zip;
-use zip::*;
+use zip::prelude::*;
 
-fn parse<S: zip::Read + zip::Seek>(mut parser: Parser<S>) {
+fn parse<S: zip::Read + zip::Seek>(parser: Parser<S>) {
     for (i, mut file) in parser.enumerate() {
         println!("{}: {}({} Bytes)", i, unsafe { file.file_name() }, file.file_size());
         let mut buf = Vec::new();
@@ -33,7 +33,7 @@ struct DataBuffer {
 impl zip_parser::Read for DataBuffer {
     fn read(&mut self, buf: &mut [u8]) -> zip_parser::ReadResult {
         // println!("read {}", buf.len());
-        let mut len = if self.buffer.len() - self.index < buf.len() {
+        let len = if self.buffer.len() - self.index < buf.len() {
             self.buffer.len() - self.index
         } else {
             buf.len()
@@ -59,7 +59,7 @@ fn file_parsing(mut file: File) {
         index: 0,
         buffer: Vec::new(),
     };
-    let file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
+    let _file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
 
     parse(Parser::new(buffer))
 }
@@ -69,7 +69,7 @@ fn main() {
     if args.len() < 2 {
         stdin_parsing();
     } else {
-        let mut file = File::open(args[1].as_str()).unwrap();
+        let file = File::open(args[1].as_str()).unwrap();
         file_parsing(file);
     }
 }

@@ -1,13 +1,33 @@
+//! # zip_parser
+//! Zip file format parser implemented by rust. support stream parsing, no_std environment.
+//!
+//! The `Parser` will search central directory at the end of zip file if `Seek` is available.
+//! Also, It supports sequence read parsing when `Seek` is not available.
+//! The type which implements `std::io::Read` implements `Read` in `std` env, and so is the `Seek`.
+//! ## example
+//! ### stream_parsing
+//! 1. from `stdin`
+//!     ```bash
+//!     cat test.zip | cargo run --features="std" --example stream_parsing
+//!     ```
+//!     or even you can cat multiple zip files:
+//!     ```bash
+//!     cat test.zip test.zip | cargo run --features="std" --example stream_parsing
+//!     ```
+//! 1. from file
+//!     ```bash
+//!     cargo run --features="std" --example stream_parsing -- test.zip
+//!     ```
+
 #![feature(specialization)]
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 use core::fmt::{Display, Formatter};
 use core::mem;
 use core::ptr;
-use core::slice::{self, Iter};
+use core::slice;
 use core::str;
 use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut};
 use core::convert::{From, TryFrom};
 
 #[cfg(feature = "std")]
@@ -143,6 +163,7 @@ impl TryFrom<&[u8]> for Signature {
     }
 }
 
+#[allow(dead_code)]
 #[repr(packed)]
 #[derive(Debug, Copy, Clone)]
 struct LocalFileHeader {
@@ -184,6 +205,7 @@ impl LocalFileHeader {
     }
 }
 
+#[allow(dead_code)]
 #[repr(packed)]
 #[derive(Debug, Copy, Clone, Default)]
 struct CentralFileHeader {
@@ -252,6 +274,7 @@ impl CentralFileHeader {
     }
 }
 
+#[allow(dead_code)]
 #[repr(packed)]
 #[derive(Debug, Copy, Clone)]
 struct CentralDirEnd {
@@ -290,43 +313,7 @@ impl CentralDirEnd {
     }
 }
 
-#[derive(Debug)]
-struct ZipFileStream<'a, S: Read + Seek> {
-    stream: *mut S,
-
-     _marker: PhantomData<&'a S>
-}
-
-impl<'a, S: Read + Seek> Deref for ZipFileStream<'a, S> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe {
-            self.stream.as_ref().unwrap()
-        }
-    }
-}
-
-impl<'a, S: Read + Seek> DerefMut for ZipFileStream<'a, S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe {
-            self.stream.as_mut().unwrap()
-        }
-    }
-}
-
-impl<'a, S: Read + Seek> Read for ZipFileStream<'a, S> {
-    fn read(&mut self, buf: &mut [u8]) -> ReadResult {
-        self.deref_mut().read(buf)
-    }
-}
-
-impl<'a, S: Read + Seek> Seek for ZipFileStream<'a, S> {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, &str> {
-        self.deref_mut().seek(pos)
-    }
-}
-
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct LocalFile<'a, S: Read + Seek> {
     file_name: [u8; 128],
@@ -370,6 +357,7 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
 //     }
 // }
 
+#[allow(dead_code)]
 pub struct Parser<'a, S: Read + Seek> {
     /// It will be None when no central directory was found
     pub number_of_files: Option<usize>,
@@ -575,9 +563,9 @@ impl<'a, S: Read + Seek> Iterator for Parser<'a, S> {
                 };
                 match self.stream.read_exact(&mut file.file_name[..file_info.file_name_length as usize]) {
                     Ok(_) => file.file_name_length = file_info.file_name_length as usize,
-                    Err(e) => {
+                    Err(_e) => {
                         #[cfg(feature = "std")]
-                        eprintln!("read filename failed: {}", e);
+                        eprintln!("read filename failed: {}", _e);
                     },
                 }
 
@@ -611,6 +599,11 @@ impl<'a, S: Read + Seek> Iterator for Parser<'a, S> {
             }
         }
     }
+}
+
+/// Prelude of zip_parser
+pub mod prelude {
+    pub use crate::{Parser, LocalFile};
 }
 
 #[cfg(test)]
