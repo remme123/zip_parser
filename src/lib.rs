@@ -1,12 +1,41 @@
-//! # zip_parser
-//! Zip file format parser implemented by rust. support stream parsing, no_std environment.
+//! Zip file format parser implemented by rust, supports stream parsing, `no_std` environment.
 //!
-//! The `Parser` will search central directory at the end of zip file if `Seek` is available.
-//! Also, It supports sequence read parsing when `Seek` is not available.
-//! The type which implements `std::io::Read` implements `Read` in `std` env, and so is the `Seek`.
-//! ## example
-//! ### stream_parsing
-//! 1. from `stdin`
+//! The [`Parser`] will search central directory at the end of zip file if [`Seek`] is available.
+//! Also, It supports sequence read parsing when [`Seek`] is not available.
+//! All types in std env implemented `std::io::Read` automatically implement [`Read`], and so is the trait [`Seek`].
+//!
+//! ## stream parsing
+//! ```
+//! use zip_parser as zip;
+//! use zip::prelude::*;
+//!
+//! #[cfg(feature = "std")]
+//! fn parse<S: zip::Read + zip::Seek>(parser: Parser<S>) {
+//!     for (i, mut file) in parser.enumerate() {
+//!         println!("{}: {}({} Bytes)", i, unsafe { file.file_name() }, file.file_size());
+//!         let mut buf = Vec::new();
+//!         buf.resize(file.file_size() as usize, 0);
+//!         if let Ok(n) = file.read(&mut buf) {
+//!             println!("Data: {:02X?}", &buf[..n]);
+//!         } else {
+//!             println!("read failed");
+//!         }
+//!         println!();
+//!     }
+//! }
+//!
+//! #[cfg(feature = "std")]
+//! fn stdin_parsing() {
+//!     println!("*** get stream from stdin ***");
+//!     parse(Parser::new(std::io::stdin().lock()))
+//! }
+//! ```
+//! You just need to pass a stream which implements [`Read`] into the [`Parser::new()`](struct.Parser.html#method.new),
+//! then you can iterate over it. For more detail, see example `stream_parsing`.
+//!
+//! ## Example
+//! ### Stream_parsing
+//! 1. From `stdin`
 //!     ```bash
 //!     cat test.zip | cargo run --features="std" --example stream_parsing
 //!     ```
@@ -14,13 +43,13 @@
 //!     ```bash
 //!     cat test.zip test.zip | cargo run --features="std" --example stream_parsing
 //!     ```
-//! 1. from file
+//! 1. From file
 //!     ```bash
 //!     cargo run --features="std" --example stream_parsing -- test.zip
 //!     ```
 
-#![feature(specialization)]
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+#![feature(specialization)]
 
 use core::fmt::{Display, Formatter};
 use core::mem;
@@ -313,6 +342,7 @@ impl CentralDirEnd {
     }
 }
 
+/// File instance in the zip pack. You can get it by iterating over the [`Parser`].
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct LocalFile<'a, S: Read + Seek> {
@@ -357,6 +387,7 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
 //     }
 // }
 
+/// Zip file parser, creating it by [`new`](struct.Parser.html#method.new) method
 #[allow(dead_code)]
 pub struct Parser<'a, S: Read + Seek> {
     /// It will be None when no central directory was found
@@ -379,6 +410,7 @@ pub struct Parser<'a, S: Read + Seek> {
 }
 
 impl<'a, S: Read + Seek> Parser<'a, S> {
+    /// Creating an instance
     pub fn new(mut stream: S) -> Self {
         // seek to the start of central directory
         let mut seek_available = false;
