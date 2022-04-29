@@ -51,16 +51,16 @@
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 #![feature(specialization)]
 
-use core::fmt::{Display, Formatter};
 use core::mem;
 use core::ptr;
 use core::slice;
 use core::str;
 use core::marker::PhantomData;
 use core::convert::{From, TryFrom};
+use core::str::Utf8Error;
 
 #[cfg(feature = "std")]
-use std::{io, fs};
+use std::io;
 
 pub type ReadResult = Result<usize, &'static str>;
 
@@ -109,19 +109,11 @@ impl Into<io::SeekFrom> for SeekFrom {
 }
 
 pub trait Seek {
-    fn seek(&mut self, _pos: SeekFrom) -> Result<u64, &str>;
-
-    fn rewind(&mut self) -> Result<(), &str>;
-
-    fn stream_len(&mut self) -> Option<u64>;
-}
-
-impl<T> Seek for T {
-    default fn seek(&mut self, _pos: SeekFrom) -> Result<u64, &str> {
+    fn seek(&mut self, _pos: SeekFrom) -> Result<u64, &str> {
         Err("unimplemented")
     }
 
-    default fn rewind(&mut self) -> Result<(), &str> {
+    fn rewind(&mut self) -> Result<(), &str> {
         if self.seek(SeekFrom::Start(0)).is_ok() {
             Ok(())
         } else {
@@ -129,7 +121,7 @@ impl<T> Seek for T {
         }
     }
 
-    default fn stream_len(&mut self) -> Option<u64> {
+    fn stream_len(&mut self) -> Option<u64> {
         None
     }
 }
@@ -192,7 +184,6 @@ impl TryFrom<&[u8]> for Signature {
     }
 }
 
-#[allow(dead_code)]
 #[repr(packed)]
 #[derive(Debug, Copy, Clone)]
 struct LocalFileHeader {
@@ -234,7 +225,6 @@ impl LocalFileHeader {
     }
 }
 
-#[allow(dead_code)]
 #[repr(packed)]
 #[derive(Debug, Copy, Clone, Default)]
 struct CentralFileHeader {
@@ -303,7 +293,6 @@ impl CentralFileHeader {
     }
 }
 
-#[allow(dead_code)]
 #[repr(packed)]
 #[derive(Debug, Copy, Clone)]
 struct CentralDirEnd {
@@ -342,10 +331,19 @@ impl CentralDirEnd {
     }
 }
 
+pub trait LocalFileOps {
+    fn file_name(&self) -> Result<&str, Utf8Error>;
+
+    fn file_size(&self) -> u64;
+
+    fn read(&mut self, buf: &mut [u8]) -> ReadResult;
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), &'static str>;
+}
+
 /// File instance in the zip pack. You can get it by iterating over the [`Parser`].
-#[allow(dead_code)]
 #[derive(Debug)]
-pub struct LocalFile<'a, S: Read + Seek> {
+pub struct LocalFile<'a, S: Read> {
     file_name: [u8; 128],
     file_name_length: usize,
     file_data_offset: u64,
@@ -358,22 +356,22 @@ pub struct LocalFile<'a, S: Read + Seek> {
     _marker: PhantomData<&'a mut S>,
 }
 
-impl<'a, S: Read + Seek> LocalFile<'a, S> {
-    pub unsafe fn file_name(&self) -> &str {
-        str::from_utf8_unchecked(&self.file_name[..self.file_name_length])
+impl<'a, S: Read> LocalFileOps for LocalFile<'a, S> {
+    fn file_name(&self) -> Result<&str, Utf8Error> {
+        str::from_utf8(&self.file_name[..self.file_name_length])
     }
 
-    pub fn file_size(&self) -> u64 {
+    fn file_size(&self) -> u64 {
         self.compressed_size
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> ReadResult {
+    fn read(&mut self, buf: &mut [u8]) -> ReadResult {
         unsafe {
             self.stream.as_mut().unwrap().read(buf)
         }
     }
 
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), &'static str> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), &'static str> {
         unsafe {
             self.stream.as_mut().unwrap().read_exact(buf)
         }
@@ -387,9 +385,15 @@ impl<'a, S: Read + Seek> LocalFile<'a, S> {
 //     }
 // }
 
+pub trait Parser<S: Read>: Iterator where
+    <Self as Iterator>::Item: LocalFileOps {
+
+    /// Creating an instance
+    fn new(stream: S) -> Self;
+}
+
 /// Zip file parser, creating it by [`new`](struct.Parser.html#method.new) method
-#[allow(dead_code)]
-pub struct Parser<'a, S: Read + Seek> {
+pub struct SeekingParser<'a, S: Read + Seek> {
     /// It will be None when no central directory was found
     pub number_of_files: Option<usize>,
 
@@ -399,26 +403,86 @@ pub struct Parser<'a, S: Read + Seek> {
 
     /// holding the file handle
     stream: S,
-    seek_available: bool,
-    stream_len: u64,
-
-    /// signature buffer
-    buffer: [u8; mem::size_of::<LocalFileHeader>()],
-    data_len_in_buffer: usize,
 
     _marker: PhantomData<&'a S>,
 }
 
-impl<'a, S: Read + Seek> Parser<'a, S> {
-    /// Creating an instance
-    pub fn new(mut stream: S) -> Self {
+impl<'a, S: Read + Seek> Iterator for SeekingParser<'a, S> {
+    type Item = LocalFile<'a, S>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // seek read
+        let _ = self.stream.seek(
+            SeekFrom::Start(self.central_directory_offset + self.next_entry_offset)
+        );
+        let mut buf = [0u8; mem::size_of::<CentralFileHeader>()];
+        match self.stream.read(&mut buf) {
+            Ok(n) if n == buf.len() => {
+                if let Some(file_info) = unsafe { CentralFileHeader::from_raw_ptr(&buf) } {
+                    #[cfg(feature = "std")]
+                    dbg!(file_info);
+                    let mut file = LocalFile {
+                        file_name: [0; 128],
+                        file_name_length: 0,
+                        file_data_offset: 0,
+                        compression_method: file_info.compression_method,
+                        compressed_size: file_info.compressed_size as u64,
+                        uncompressed_size: file_info.uncompressed_size as u64,
+                        stream: &mut self.stream,
+                        _marker: PhantomData,
+                    };
+                    if let Ok(n) = self
+                        .stream
+                        .read(&mut file.file_name[..file_info.file_name_length as usize]) {
+                        file.file_name_length = n;
+                    }
+
+                    // set next entry
+                    self.next_entry_offset += file_info.len() as u64;
+
+                    // seek to file data
+                    let mut local_header_buf = [0u8; mem::size_of::<LocalFileHeader>()];
+                    let _ = self.stream.seek(SeekFrom::Start(file_info.relative_offset_of_local_header as u64));
+                    if matches!(self.stream.read(&mut local_header_buf), Ok(n) if n == local_header_buf.len()) {
+                        if let Some(local_header) = unsafe { LocalFileHeader::from_raw_ptr(&local_header_buf) } {
+                            file.file_data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
+                            Some(file)
+                        } else {
+                            #[cfg(feature = "std")]
+                            eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", local_header_buf);
+                            None
+                        }
+                    } else {
+                        #[cfg(feature = "std")]
+                        eprintln!("read local header failed");
+                        None
+                    }
+                } else {
+                    #[cfg(feature = "std")]
+                    eprintln!("get CentralFileHeader from raw ptr({:02X?}) failed", buf);
+                    None
+                }
+            }
+            Ok(_n) => {
+                #[cfg(feature = "std")]
+                eprintln!("no enough data: {}", _n);
+                None
+            }
+            Err(_e) => {
+                #[cfg(feature = "std")]
+                eprintln!("stream read err: {}", _e);
+                None
+            }
+        }
+    }
+}
+
+impl<'a, S: Read + Seek> Parser<S> for SeekingParser<'a, S> {
+    fn new(mut stream: S) -> Self {
         // seek to the start of central directory
-        let mut seek_available = false;
-        let mut stream_len = 0u64;
         let mut central_directory_offset = 0u64;
         let mut number_of_files = None;
-        if let Some(len) = stream.stream_len() {
-            stream_len = len;
+        if let Some(stream_len) = stream.stream_len() {
             const READ_LEN: usize = mem::size_of::<CentralDirEnd>();
             if let Ok(_) = stream.seek(SeekFrom::Start(stream_len - READ_LEN as u64)) {
                 let mut buf = [0u8; READ_LEN];
@@ -426,7 +490,6 @@ impl<'a, S: Read + Seek> Parser<'a, S> {
                     if matches!([buf[0], buf[1], buf[2], buf[3]].into(), Signature::CentralDirEnd) {
                         let central_dir = unsafe { CentralDirEnd::from_raw_ptr(&buf).unwrap() };
                         let _ = stream.seek(SeekFrom::Start(central_dir.central_directory_offset as u64));
-                        seek_available = true;
                         central_directory_offset = central_dir.central_directory_offset.into();
                         number_of_files = Some(central_dir.total_entries_this_disk.into());
                     } else {
@@ -437,20 +500,158 @@ impl<'a, S: Read + Seek> Parser<'a, S> {
                 }
             } else {
                 #[cfg(feature = "std")]
-                eprintln!("seek is unavailable");
+                eprintln!("seek is unavailable, use SequentialParser instead");
             }
         } else {
             #[cfg(feature = "std")]
-            eprintln!("stream_len is unavailable");
+            eprintln!("seek is unavailable, use SequentialParser instead");
         }
 
         Self {
             stream,
-            seek_available,
-            stream_len,
             central_directory_offset,
             next_entry_offset: 0,
             number_of_files,
+            _marker: PhantomData,
+        }
+    }
+}
+
+pub struct SequentialParser<'a, S: Read> {
+    /// holding the file handle
+    stream: S,
+
+    /// signature buffer
+    buffer: [u8; mem::size_of::<LocalFileHeader>()],
+    data_len_in_buffer: usize,
+
+    _marker: PhantomData<&'a S>,
+}
+
+// impl<'a, S: Read> SequentialParser<'a, S> {
+//     /// Creating an instance
+//     pub fn new(stream: S) -> Self {
+//         Self {
+//             stream,
+//             buffer: [0; mem::size_of::<LocalFileHeader>()],
+//             data_len_in_buffer: 0,
+//             _marker: PhantomData,
+//         }
+//     }
+// }
+
+impl<'a, S: Read> Iterator for SequentialParser<'a, S> {
+    type Item = LocalFile<'a, S>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // read enough data
+            let read_len = self.buffer.len() - self.data_len_in_buffer;
+            if let Ok(n) = self.stream.read(&mut self.buffer[self.data_len_in_buffer..]) {
+                if n == 0 {
+                    return None;
+                } else if n < read_len {
+                    self.data_len_in_buffer += n;
+                    continue;
+                } else {
+                    self.data_len_in_buffer += n;
+                }
+            } else {
+                #[cfg(feature = "std")]
+                eprintln!("read local header failed");
+                return None;
+            }
+
+            // search LocalFileHeader
+            // search signature
+            let mut header_found = false;
+            for (i, _v) in self.buffer.iter().take(self.data_len_in_buffer - 3).enumerate() {
+                if self.buffer[i..i+4] == [0x50, 0x4b, 0x03, 0x04] {
+                    unsafe {
+                        let len = self.data_len_in_buffer - i;
+                        ptr::copy(self.buffer.as_ptr().offset(i as isize),
+                                  self.buffer.as_mut_ptr(),
+                                  len);
+                        self.data_len_in_buffer = len;
+                        header_found = true;
+                    }
+                    #[cfg(feature = "std")]
+                    println!("found signature at {}", i);
+                    break;
+                }
+            }
+            // save the last 3 bytes if header was not found
+            if header_found == false {
+                for i in 0..3 {
+                    self.buffer[i] = self.buffer[self.data_len_in_buffer - 3 + i];
+                }
+                self.data_len_in_buffer = 3;
+                continue;
+            }
+
+            // begin to parse if data is ready
+            if self.data_len_in_buffer == self.buffer.len() {
+                break;
+            }
+        }
+
+        // parse header
+        if let Some(file_info) = unsafe { LocalFileHeader::from_raw_ptr(&self.buffer) } {
+            #[cfg(feature = "std")]
+            dbg!(file_info);
+            let mut file = LocalFile {
+                file_name: [0; 128],
+                file_name_length: 0,
+                file_data_offset: 0,
+                compression_method: file_info.compression_method,
+                compressed_size: file_info.compressed_size as u64,
+                uncompressed_size: file_info.uncompressed_size as u64,
+                stream: &mut self.stream,
+                _marker: PhantomData,
+            };
+            match self.stream.read_exact(&mut file.file_name[..file_info.file_name_length as usize]) {
+                Ok(_) => file.file_name_length = file_info.file_name_length as usize,
+                Err(_e) => {
+                    #[cfg(feature = "std")]
+                    eprintln!("read filename failed: {}", _e);
+                },
+            }
+
+            // drop data unprocessed
+            {
+                let mut len = file_info.extra_field_length as usize;
+                let mut buf = [0u8; 16];
+                loop {
+                    let read_len = if len > 16 { 16 } else { len };
+                    if let Ok(n) = self.stream.read(&mut buf[..read_len]) {
+                        len -= n;
+                        if len == 0 {
+                            break;
+                        }
+                    } else {
+                        #[cfg(feature = "std")]
+                        eprintln!("drop data read failed");
+                        return None;
+                    }
+                }
+            }
+
+            // reset for next header
+            self.data_len_in_buffer = 0;
+
+            Some(file)
+        } else {
+            #[cfg(feature = "std")]
+            eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", self.buffer);
+            None
+        }
+    }
+}
+
+impl<'a, S: Read> Parser<S> for SequentialParser<'a, S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
             buffer: [0; mem::size_of::<LocalFileHeader>()],
             data_len_in_buffer: 0,
             _marker: PhantomData,
@@ -458,184 +659,9 @@ impl<'a, S: Read + Seek> Parser<'a, S> {
     }
 }
 
-impl<'a, S: Read + Seek> Iterator for Parser<'a, S> {
-    type Item = LocalFile<'a, S>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.seek_available {
-            // seek read
-            let _ = self.stream.seek(
-                SeekFrom::Start(self.central_directory_offset + self.next_entry_offset)
-            );
-            let mut buf = [0u8; mem::size_of::<CentralFileHeader>()];
-            match self.stream.read(&mut buf) {
-                Ok(n) if n == buf.len() => {
-                    if let Some(file_info) = unsafe { CentralFileHeader::from_raw_ptr(&buf) } {
-                        #[cfg(feature = "std")]
-                        dbg!(file_info);
-                        let mut file = LocalFile {
-                            file_name: [0; 128],
-                            file_name_length: 0,
-                            file_data_offset: 0,
-                            compression_method: file_info.compression_method,
-                            compressed_size: file_info.compressed_size as u64,
-                            uncompressed_size: file_info.uncompressed_size as u64,
-                            stream: &mut self.stream,
-                            _marker: PhantomData,
-                        };
-                        if let Ok(n) = self
-                            .stream
-                            .read(&mut file.file_name[..file_info.file_name_length as usize]) {
-                            file.file_name_length = n;
-                        }
-
-                        // set next entry
-                        self.next_entry_offset += file_info.len() as u64;
-
-                        // seek to file data
-                        let mut local_header_buf = [0u8; mem::size_of::<LocalFileHeader>()];
-                        let _ = self.stream.seek(SeekFrom::Start(file_info.relative_offset_of_local_header as u64));
-                        if matches!(self.stream.read(&mut local_header_buf), Ok(n) if n == local_header_buf.len()) {
-                            if let Some(local_header) = unsafe { LocalFileHeader::from_raw_ptr(&local_header_buf) } {
-                                file.file_data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
-                                Some(file)
-                            } else {
-                                #[cfg(feature = "std")]
-                                eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", local_header_buf);
-                                None
-                            }
-                        } else {
-                            #[cfg(feature = "std")]
-                            eprintln!("read local header failed");
-                            None
-                        }
-                    } else {
-                        #[cfg(feature = "std")]
-                        eprintln!("get CentralFileHeader from raw ptr({:02X?}) failed", buf);
-                        None
-                    }
-                }
-                Ok(_n) => {
-                    #[cfg(feature = "std")]
-                    eprintln!("no enough data: {}", _n);
-                    None
-                }
-                Err(_e) => {
-                    #[cfg(feature = "std")]
-                    eprintln!("stream read err: {}", _e);
-                    None
-                }
-            }
-        } else {
-            // sequential read
-            loop {
-                // read enough data
-                let read_len = self.buffer.len() - self.data_len_in_buffer;
-                if let Ok(n) = self.stream.read(&mut self.buffer[self.data_len_in_buffer..]) {
-                    if n == 0 {
-                        return None;
-                    } else if n < read_len {
-                        self.data_len_in_buffer += n;
-                        continue;
-                    } else {
-                        self.data_len_in_buffer += n;
-                    }
-                } else {
-                    #[cfg(feature = "std")]
-                    eprintln!("read local header failed");
-                    return None;
-                }
-
-                // search LocalFileHeader
-                // search signature
-                let mut header_found = false;
-                for (i, _v) in self.buffer.iter().take(self.data_len_in_buffer - 3).enumerate() {
-                    if self.buffer[i..i+4] == [0x50, 0x4b, 0x03, 0x04] {
-                        unsafe {
-                            let len = self.data_len_in_buffer - i;
-                            ptr::copy(self.buffer.as_ptr().offset(i as isize),
-                                      self.buffer.as_mut_ptr(),
-                                      len);
-                            self.data_len_in_buffer = len;
-                            header_found = true;
-                        }
-                        #[cfg(feature = "std")]
-                        println!("found signature at {}", i);
-                        break;
-                    }
-                }
-                // save the last 3 bytes if header was not found
-                if header_found == false {
-                    for i in 0..3 {
-                        self.buffer[i] = self.buffer[self.data_len_in_buffer - 3 + i];
-                    }
-                    self.data_len_in_buffer = 3;
-                    continue;
-                }
-
-                // begin to parse if data is ready
-                if self.data_len_in_buffer == self.buffer.len() {
-                    break;
-                }
-            }
-
-            // parse header
-            if let Some(file_info) = unsafe { LocalFileHeader::from_raw_ptr(&self.buffer) } {
-                #[cfg(feature = "std")]
-                dbg!(file_info);
-                let mut file = LocalFile {
-                    file_name: [0; 128],
-                    file_name_length: 0,
-                    file_data_offset: 0,
-                    compression_method: file_info.compression_method,
-                    compressed_size: file_info.compressed_size as u64,
-                    uncompressed_size: file_info.uncompressed_size as u64,
-                    stream: &mut self.stream,
-                    _marker: PhantomData,
-                };
-                match self.stream.read_exact(&mut file.file_name[..file_info.file_name_length as usize]) {
-                    Ok(_) => file.file_name_length = file_info.file_name_length as usize,
-                    Err(_e) => {
-                        #[cfg(feature = "std")]
-                        eprintln!("read filename failed: {}", _e);
-                    },
-                }
-
-                // drop data unprocessed
-                {
-                    let mut len = file_info.extra_field_length as usize;
-                    let mut buf = [0u8; 16];
-                    loop {
-                        let read_len = if len > 16 { 16 } else { len };
-                        if let Ok(n) = self.stream.read(&mut buf[..read_len]) {
-                            len -= n;
-                            if len == 0 {
-                                break;
-                            }
-                        } else {
-                            #[cfg(feature = "std")]
-                            eprintln!("drop data read failed");
-                            return None;
-                        }
-                    }
-                }
-
-                // reset for next header
-                self.data_len_in_buffer = 0;
-
-                Some(file)
-            } else {
-                #[cfg(feature = "std")]
-                eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", self.buffer);
-                None
-            }
-        }
-    }
-}
-
 /// Prelude of zip_parser
 pub mod prelude {
-    pub use crate::{Parser, LocalFile};
+    pub use crate::{Parser, SequentialParser, SeekingParser, LocalFileOps};
 }
 
 #[cfg(test)]

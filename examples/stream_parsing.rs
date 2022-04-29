@@ -5,9 +5,10 @@ use std::io::{Read, stdin};
 use zip_parser as zip;
 use zip::prelude::*;
 
-fn parse<S: zip::Read + zip::Seek>(parser: Parser<S>) {
+fn parse<'a, S: zip::Read, P: zip::Parser<S>>(parser: P) where
+    <P as Iterator>::Item: zip_parser::LocalFileOps {
     for (i, mut file) in parser.enumerate() {
-        println!("{}: {}({} Bytes)", i, unsafe { file.file_name() }, file.file_size());
+        println!("{}: {}({} Bytes)", i, file.file_name().unwrap_or("NoFileName"), file.file_size());
         let mut buf = Vec::new();
         buf.resize(file.file_size() as usize, 0);
         if let Err(e) = file.read_exact(&mut buf) {
@@ -21,7 +22,7 @@ fn parse<S: zip::Read + zip::Seek>(parser: Parser<S>) {
 
 fn stdin_parsing() {
     println!("*** get stream from stdin ***");
-    parse(Parser::new(stdin().lock()))
+    parse(SequentialParser::new(stdin().lock()))
 }
 
 #[derive(Debug)]
@@ -61,7 +62,7 @@ fn file_parsing(mut file: File) {
     };
     let _file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
 
-    parse(Parser::new(buffer))
+    parse(SequentialParser::new(buffer))
 }
 
 fn main() {

@@ -10,8 +10,8 @@ fn main() {
         panic!("no zip file specified")
     }
     let file = File::open(args[1].as_str()).unwrap();
-    for (i, mut file) in Parser::new(file).enumerate() {
-        println!("{}: {}({} Bytes): {:02X?}", i, unsafe { file.file_name() }, file.file_size(), file);
+    for (i, mut file) in SeekingParser::new(file).enumerate() {
+        println!("{}: {}({} Bytes): {:02X?}", i, file.file_name().unwrap_or("NoFileName"), file.file_size(), file);
         let mut buf = [0u8; 16];
         if let Ok(n) = file.read(&mut buf) {
             println!("Data: {:02X?}", &buf[..n]);

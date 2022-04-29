@@ -1,6 +1,6 @@
 [package]
 name = "zip_parser"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2018"
 license = "MIT"
 repository = "https://github.com/remme123/zip_parser"
@@ -15,7 +15,7 @@ std = []
 [dependencies]
 
 [[example]]
-name = "parse_zip_file"
+name = "file_parsing"
 required-features = ["std"]
 
 [[example]]
