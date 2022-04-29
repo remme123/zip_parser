@@ -1,6 +1,6 @@
 [package]
 name = "zip_parser"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2018"
 license = "MIT"
 repository = "https://github.com/remme123/zip_parser"

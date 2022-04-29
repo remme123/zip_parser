@@ -49,7 +49,6 @@
 //!     ```
 
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
-#![feature(specialization)]
 
 use core::mem;
 use core::ptr;
