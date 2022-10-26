@@ -1,14 +1,18 @@
 use std::env;
 use std::fs::File;
 use std::io::{Read, stdin};
+use std::cmp;
 
 use zip_parser as zip;
 use zip::prelude::*;
 
-fn parse<'a, S: zip::Read, P: zip::Parser<S>>(parser: P) where
-    <P as Iterator>::Item: zip_parser::LocalFileOps {
+fn parse<'a, P>(parser: P)
+where
+    P: Iterator,
+    P::Item: zip_parser::LocalFileOps
+{
     for (i, mut file) in parser.enumerate() {
-        println!("{}: {}({} Bytes)", i, file.file_name().unwrap_or("NoFileName"), file.file_size());
+        println!("#{}: {}({} Bytes)", i, file.file_name().unwrap_or("NoFileName"), file.file_size());
         let mut buf = Vec::new();
         buf.resize(file.file_size() as usize, 0);
         if let Err(e) = file.read_exact(&mut buf) {
@@ -20,9 +24,11 @@ fn parse<'a, S: zip::Read, P: zip::Parser<S>>(parser: P) where
     }
 }
 
+use std::io::StdinLock;
+
 fn stdin_parsing() {
     println!("*** get stream from stdin ***");
-    parse(SequentialParser::new(stdin().lock()))
+    parse(SequentialParser::<StdinLock<'_>>::new(&mut stdin().lock()))
 }
 
 #[derive(Debug)]
@@ -32,13 +38,12 @@ struct DataBuffer {
 }
 
 impl zip_parser::Read for DataBuffer {
-    fn read(&mut self, buf: &mut [u8]) -> zip_parser::ReadResult {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ParsingError> {
         // println!("read {}", buf.len());
-        let len = if self.buffer.len() - self.index < buf.len() {
-            self.buffer.len() - self.index
-        } else {
-            buf.len()
-        };
+        let len = cmp::min(
+            self.buffer.len() - self.index,
+            buf.len(),
+        );
         // limit read size, only for live streaming parsing test
         // if len > 8 {
         //     len = 8;
@@ -49,20 +54,48 @@ impl zip_parser::Read for DataBuffer {
             // println!("return {}", len);
             Ok(len)
         } else {
-            Ok(0)
+            Err(ParsingError::StreamEnding)
         }
     }
 }
 
-fn file_parsing(mut file: File) {
+fn file_stream_parsing(mut file: File) {
     println!("*** get stream from file ***");
     let mut buffer = DataBuffer {
         index: 0,
         buffer: Vec::new(),
     };
-    let _file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
+    let file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
+    println!("zip size: {} bytes", file_size);
 
-    parse(SequentialParser::new(buffer))
+    println!("SequentialParser:");
+    parse(SequentialParser::<DataBuffer>::new(&mut buffer));
+
+    println!("\n\nPassiveParser:");
+    let mut parser = PassiveParser::<DataBuffer, 128>::new();
+    parser.feed_data(
+        &buffer.buffer,
+        |evt| {
+            match evt {
+                ParserEvent::LocalFileHeader(file_index, file) => {
+                    println!("#{}: {}({}/{} bytes)",
+                    file_index, file.file_name().unwrap_or("Utf8EncodeErr"),
+                        file.compressed_size, file.uncompressed_size);
+                    true
+                },
+                ParserEvent::ParsingError(_file_index, e) => {
+                    println!("error: {e}");
+                    false
+                },
+                _ => {
+                    // println!("unprocessed event: {evt:?}");
+                    true
+                },
+            }
+        }
+    );
+    println!(r#"zip file comment: "{}""#, parser.file_comment().unwrap())
+
 }
 
 fn main() {
@@ -71,6 +104,6 @@ fn main() {
         stdin_parsing();
     } else {
         let file = File::open(args[1].as_str()).unwrap();
-        file_parsing(file);
+        file_stream_parsing(file);
     }
 }

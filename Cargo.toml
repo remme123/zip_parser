@@ -1,11 +1,11 @@
 [package]
 name = "zip_parser"
-version = "0.2.1"
-edition = "2018"
+version = "0.3.0"
+edition = "2021"
 license = "MIT"
 repository = "https://github.com/remme123/zip_parser"
-keywords = ["zip", "parser", "no_std", "stream"]
-description = "A zip file format parser, supporting no_std environment, stream parsing, seeking."
+keywords = ["zip", "parser", "no_std"]
+description = "A zip file format parser, supporting no_std environment, stream parsing and seeking."
 
 [features]
 std = []
