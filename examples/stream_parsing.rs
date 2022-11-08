@@ -72,7 +72,7 @@ fn file_stream_parsing(mut file: File) {
     parse(SequentialParser::<DataBuffer>::new(&mut buffer));
 
     println!("\n\nPassiveParser:");
-    let mut parser = PassiveParser::<DataBuffer, 128>::new();
+    let mut parser = PassiveParser::<128>::new();
     parser.feed_data(
         &buffer.buffer,
         |evt| {

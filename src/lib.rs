@@ -51,12 +51,8 @@
 //! read data from a file and [`PassiveParser::feed_data`] to the parser.
 //!
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![allow(dead_code)]
-
-#[cfg(feature = "std")]
-#[macro_use]
-extern crate std;
 
 use core::fmt::Display;
 use core::{
@@ -337,12 +333,8 @@ pub trait LocalFileOps {
 
 /// Parser event for callback
 #[derive(Debug, Clone, Copy)]
-pub enum ParserEvent<'a, 'b, 'c, S, const N: usize>
-where
-    S: Read + 'a,
-    'a: 'c,
-{
-    LocalFileHeader(i32, &'c LocalFile<'a, S, N>),
+pub enum ParserEvent<'b, 'c, const N: usize> {
+    LocalFileHeader(i32, &'c LocalFileInfo<N>),
     LocalFileData{file_index: i32, offset: usize, data: &'b [u8]},
     LocalFileEnd(i32),
 
@@ -397,8 +389,8 @@ impl Display for ParsingError {
     }
 }
 
-#[repr(u16)]
-#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompressMethod {
     Uncompress = 0,
     Shrunk = 1,
@@ -428,7 +420,7 @@ pub enum CompressMethod {
     /// JPEG variant
     JPEG = 96,
 
-    Unknown = 0xFFFF,
+    Unknown = 0xFF,
 }
 
 impl From<u16> for CompressMethod {
@@ -454,9 +446,8 @@ impl From<u16> for CompressMethod {
     }
 }
 
-/// File instance in the zip pack. You can get it by iterating over the [`Parser`].
 #[derive(Debug)]
-pub struct LocalFile<'a, S: Read, const N: usize> {
+pub struct LocalFileInfo<const N: usize> {
     file_name_buffer: [u8; N],
     file_name_length: usize,
     extra_field_length: usize,
@@ -465,12 +456,9 @@ pub struct LocalFile<'a, S: Read, const N: usize> {
     pub compression_method: CompressMethod,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
-
-    stream: *mut S,
-    _marker: PhantomData<&'a mut S>,
 }
 
-impl<'a, S: Read, const N: usize> LocalFile<'a, S, N> {
+impl<const N: usize> LocalFileInfo<N> {
     pub fn with_compression_method(mut self, method: CompressMethod) -> Self {
         self.compression_method = method;
         self
@@ -486,13 +474,16 @@ impl<'a, S: Read, const N: usize> LocalFile<'a, S, N> {
         self
     }
 
-    pub fn with_stream(mut self, stream: &mut S) -> Self {
-        self.stream = stream;
-        self
+    pub fn file_name(&self) -> Result<&str, Utf8Error> {
+        str::from_utf8(&self.file_name_buffer[..self.file_name_length])
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.compressed_size
     }
 }
 
-impl<'a, S: Read, const N: usize> Default for LocalFile<'a, S, N> {
+impl<const N: usize> Default for LocalFileInfo<N> {
     fn default() -> Self {
         Self {
             file_name_buffer: [0; N],
@@ -502,6 +493,45 @@ impl<'a, S: Read, const N: usize> Default for LocalFile<'a, S, N> {
             compression_method: CompressMethod::Uncompress,
             compressed_size: 0,
             uncompressed_size: 0,
+        }
+    }
+}
+
+/// File instance in the zip pack. You can get it by iterating over the [`Parser`].
+#[derive(Debug)]
+pub struct LocalFile<'a, S: Read, const N: usize> {
+    pub info: LocalFileInfo<N>,
+
+    stream: *mut S,
+    _marker: PhantomData<&'a mut S>,
+}
+
+impl<'a, S: Read, const N: usize> LocalFile<'a, S, N> {
+    pub fn with_compression_method(mut self, method: CompressMethod) -> Self {
+        self.info.compression_method = method;
+        self
+    }
+
+    pub fn with_compressed_size(mut self, size: u64) -> Self {
+        self.info.compressed_size = size;
+        self
+    }
+
+    pub fn with_uncompressed_size(mut self, size: u64) -> Self {
+        self.info.uncompressed_size = size;
+        self
+    }
+
+    pub fn with_stream(mut self, stream: &mut S) -> Self {
+        self.stream = stream;
+        self
+    }
+}
+
+impl<'a, S: Read, const N: usize> Default for LocalFile<'a, S, N> {
+    fn default() -> Self {
+        Self {
+            info: Default::default(),
             stream: ptr::null_mut(),
             _marker:  PhantomData::default(),
         }
@@ -510,11 +540,11 @@ impl<'a, S: Read, const N: usize> Default for LocalFile<'a, S, N> {
 
 impl<'a, S: Read, const N: usize> LocalFileOps for LocalFile<'a, S, N> {
     fn file_name(&self) -> Result<&str, Utf8Error> {
-        str::from_utf8(&self.file_name_buffer[..self.file_name_length])
+        self.info.file_name()
     }
 
     fn file_size(&self) -> u64 {
-        self.compressed_size
+        self.info.file_size()
     }
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ParsingError> {
@@ -621,8 +651,8 @@ impl<'a, S: Read + Seek, const N: usize> Iterator for SeekingParser<'a, S, N> {
                         .with_stream(self.stream);
                     if let Ok(n) = self
                         .stream
-                        .read(&mut file.file_name_buffer[..file_info.file_name_length as usize]) {
-                        file.file_name_length = n;
+                        .read(&mut file.info.file_name_buffer[..file_info.file_name_length as usize]) {
+                        file.info.file_name_length = n;
                     }
 
                     // set next entry
@@ -633,7 +663,7 @@ impl<'a, S: Read + Seek, const N: usize> Iterator for SeekingParser<'a, S, N> {
                     let _ = self.stream.seek(SeekFrom::Start(file_info.relative_offset_of_local_header as u64));
                     if matches!(self.stream.read(&mut local_header_buf), Ok(n) if n == local_header_buf.len()) {
                         if let Some(local_header) = unsafe { LocalFileHeader::from_bytes(&local_header_buf) } {
-                            file.file_data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
+                            file.info.file_data_offset = file_info.relative_offset_of_local_header as u64 + local_header.len() as u64;
                             Some(file)
                         } else {
                             #[cfg(feature = "std")]
@@ -755,8 +785,8 @@ impl<'a, S: Read, const N: usize> Iterator for SequentialParser<'a, S, N> {
                 .with_stream(self.stream);
 
             // read file name
-            match self.stream.read_exact(&mut file.file_name_buffer[..file_info.file_name_length as usize]) {
-                Ok(_) => file.file_name_length = file_info.file_name_length as usize,
+            match self.stream.read_exact(&mut file.info.file_name_buffer[..file_info.file_name_length as usize]) {
+                Ok(_) => file.info.file_name_length = file_info.file_name_length as usize,
                 Err(_e) => {
                     #[cfg(feature = "std")]
                     eprintln!("read filename failed: {}", _e);
@@ -812,7 +842,7 @@ pub enum DataStream<'a> {
     End,
 }
 
-pub struct PassiveParser<'a, S: Read, const N: usize> {
+pub struct PassiveParser<const N: usize> {
     /// header buffer
     buffer: [u8; CENTRAL_FILE_HEADER_LEN],
     buffer_data_index: usize,
@@ -820,7 +850,7 @@ pub struct PassiveParser<'a, S: Read, const N: usize> {
     #[cfg(feature = "std")]
     zip_file_comment: Vec<u8>,
 
-    pub localfile: Option<LocalFile<'a, S, N>>,
+    pub localfile_info: Option<LocalFileInfo<N>>,
 
     localfile_index: i32,
     centralfile_index: i32,
@@ -843,7 +873,7 @@ pub struct PassiveParser<'a, S: Read, const N: usize> {
     pub state: ParserState,
 }
 
-impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
+impl<const N: usize> PassiveParser<N> {
     fn free_space(&self) -> usize {
         if self.buffer_data_index > self.buffer.len() {
             0
@@ -888,7 +918,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
         self.buffer.fill(0);
         self.buffer_data_index = 0;
 
-        self.localfile = None;
+        self.localfile_info = None;
         self.localfile_index = 0;
         self.centralfile_index = 0;
 
@@ -925,7 +955,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
 
     pub fn feed_data<F>(&mut self, data: &[u8], mut on_event: F)
     where
-        F: for<'b, 'c> FnMut(ParserEvent<'a, 'b, 'c, S, N>) -> bool,
+        F: for<'b, 'c> FnMut(ParserEvent<'b, 'c, N>) -> bool,
     {
         let mut count = 0;
         let res: Result<usize, usize> = loop {
@@ -941,6 +971,9 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
                         data.len() - count,
                     );
                     count += self.append_bytes(&data[count..count + len]);
+
+                    // #[cfg(feature = "std")]
+                    // println!("count:{} data:{:02X?}", count, self.buffer_data());
 
                     // check signature
                     if self.buffer_data_len() < 4 {
@@ -1026,17 +1059,18 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
                         // header is ready
                         self.state = ParserState::RecvLocalFileName;
 
-                        let file = LocalFile::default()
-                            .with_compression_method(CompressMethod::from(file_info.compression_method))
-                            .with_compressed_size(file_info.compressed_size as u64)
-                            .with_uncompressed_size(file_info.uncompressed_size as u64);
-                        self.localfile.replace(file);
                         self.file_name_index = 0;
                         self.file_name_len = file_info.file_name_length as usize;
                         self.extra_field_index = 0;
                         self.extra_field_len = file_info.extra_field_length as usize;
                         self.file_data_index = 0;
                         self.file_data_len = file_info.compressed_size as usize;
+
+                        let localfile_info = LocalFileInfo::default()
+                            .with_compression_method(CompressMethod::from(file_info.compression_method))
+                            .with_compressed_size(file_info.compressed_size as u64)
+                            .with_uncompressed_size(file_info.uncompressed_size as u64);
+                        self.localfile_info.replace(localfile_info);
 
                         // The data size in buffer must equal to LOCAL_FILE_HEADER_LEN
                         self.buffer_data_index = 0;
@@ -1057,7 +1091,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
                 }
                 ParserState::RecvLocalFileName => {
                     // if header is ready
-                    if self.localfile.is_none() {
+                    if self.localfile_info.is_none() {
                         let err = ParsingError::LocalFileHeaderNotRecved(self.localfile_index);
                         let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
                         if res == false {
@@ -1076,7 +1110,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
 
                     // save filename
                     if self.file_name_index >= self.file_name_len {
-                        self.localfile.as_mut().unwrap().file_name_length = self.file_name_len;
+                        self.localfile_info.as_mut().unwrap().file_name_length = self.file_name_len;
 
                         self.state = ParserState::RecvLocalFileExtraField;
                     } else {
@@ -1084,7 +1118,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
                             self.file_name_len - self.file_name_index,
                             data.len() - count,
                         );
-                        self.localfile.as_mut().unwrap()
+                        self.localfile_info.as_mut().unwrap()
                             .file_name_buffer[self.file_name_index..self.file_name_index + len]
                             .as_mut()
                             .copy_from_slice(&data[count..count + len]);
@@ -1096,7 +1130,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
                 }
                 ParserState::RecvLocalFileExtraField => {
                     if self.extra_field_index >= self.extra_field_len {
-                        let res = on_event(ParserEvent::LocalFileHeader(self.localfile_index, self.localfile.as_ref().unwrap()));
+                        let res = on_event(ParserEvent::LocalFileHeader(self.localfile_index, self.localfile_info.as_ref().unwrap()));
 
                         self.state = ParserState::RecvLocalFileData;
 
@@ -1251,7 +1285,7 @@ impl<'a, S: Read, const N: usize> PassiveParser<'a, S, N> {
     }
 }
 
-impl<'a, S: Read, const N: usize> Default for PassiveParser<'a, S, N> {
+impl<const N: usize> Default for PassiveParser<N> {
     fn default() -> Self {
         Self {
             state: ParserState::RecvHeader,
@@ -1262,7 +1296,7 @@ impl<'a, S: Read, const N: usize> Default for PassiveParser<'a, S, N> {
             buffer: [0; CENTRAL_FILE_HEADER_LEN],
             buffer_data_index: 0,
 
-            localfile: None,
+            localfile_info: None,
             localfile_index: 0,
             centralfile_index: 0,
 
