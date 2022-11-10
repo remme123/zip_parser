@@ -836,16 +836,9 @@ pub enum ParserState {
     RecvLocalFileData,
 }
 
-pub enum DataStream<'a> {
-    Start,
-    Data(&'a [u8]),
-    End,
-}
-
 pub struct PassiveParser<const N: usize> {
     /// header buffer
-    buffer: [u8; CENTRAL_FILE_HEADER_LEN],
-    buffer_data_index: usize,
+    buffer: heapless::Vec<u8, CENTRAL_FILE_HEADER_LEN>,
 
     #[cfg(feature = "std")]
     zip_file_comment: Vec<u8>,
@@ -874,34 +867,13 @@ pub struct PassiveParser<const N: usize> {
 }
 
 impl<const N: usize> PassiveParser<N> {
-    fn free_space(&self) -> usize {
-        if self.buffer_data_index > self.buffer.len() {
-            0
-        } else {
-            self.buffer.len() - self.buffer_data_index
-        }
-    }
-
-    fn buffer_data_len(&self) -> usize {
-        if self.buffer_data_index > self.buffer.len() {
-            self.buffer.len()
-        } else {
-            self.buffer_data_index
-        }
-    }
-
-    fn buffer_data(&self) -> &[u8] {
-        &self.buffer[..self.buffer_data_len()]
-    }
-
     fn append_bytes(&mut self, data: &[u8]) -> usize {
-        let len = if data.len() > self.free_space() {
-            self.free_space()
+        let len = if data.len() + self.buffer.len() > self.buffer.capacity() {
+            self.buffer.capacity() - self.buffer.len()
         } else {
             data.len()
         };
-        (&mut self.buffer[self.buffer_data_index..self.buffer_data_index + len]).copy_from_slice(&data[..len]);
-        self.buffer_data_index += len;
+        self.buffer.extend_from_slice(&data[..len]).unwrap();
         len
     }
 
@@ -915,8 +887,7 @@ impl<const N: usize> PassiveParser<N> {
         #[cfg(feature = "std")]
         { self.zip_file_comment = Vec::new(); }
 
-        self.buffer.fill(0);
-        self.buffer_data_index = 0;
+        self.buffer.clear();
 
         self.localfile_info = None;
         self.localfile_index = 0;
@@ -936,10 +907,6 @@ impl<const N: usize> PassiveParser<N> {
 
         self.central_dir_end_index = 0;
         self.central_dir_end_len = 0;
-    }
-
-    pub fn buffer_size(&self) -> usize {
-        self.buffer.len()
     }
 
     pub fn localfile_index(&self) -> i32 {
@@ -967,7 +934,7 @@ impl<const N: usize> PassiveParser<N> {
                 ParserState::RecvHeader => {
                     // queue data
                     let len = cmp::min(
-                        4 - self.buffer_data_len(),
+                        4 - self.buffer.len(),
                         data.len() - count,
                     );
                     count += self.append_bytes(&data[count..count + len]);
@@ -976,12 +943,12 @@ impl<const N: usize> PassiveParser<N> {
                     // println!("count:{} data:{:02X?}", count, self.buffer_data());
 
                     // check signature
-                    if self.buffer_data_len() < 4 {
+                    if self.buffer.len() < 4 {
                         continue;
                     }
 
                     // parse signature type
-                    match Signature::try_from(self.buffer_data()) {
+                    match Signature::try_from(self.buffer.as_ref()) {
                         Err(err) => {
                             let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
                             if res == false {
@@ -1000,54 +967,15 @@ impl<const N: usize> PassiveParser<N> {
                 ParserState::RecvLocalFileHeader => {
                     // queue data
                     let len = cmp::min(
-                        LOCAL_FILE_HEADER_LEN - self.buffer_data_len(),
+                        LOCAL_FILE_HEADER_LEN - self.buffer.len(),
                         data.len() - count,
                     );
                     count += self.append_bytes(&data[count..count + len]);
 
                     // header is not ready
-                    if self.buffer_data_len() < LOCAL_FILE_HEADER_LEN {
+                    if self.buffer.len() < LOCAL_FILE_HEADER_LEN {
                         continue;
                     }
-
-                    // search LocalFileHeader
-                    // {
-                    //     search signature
-                    //     let mut header_found = false;
-                    //     for (i, _v) in self.buffer.iter().take(self.buffer_data_index - 3).enumerate() {
-                    //         if self.buffer[i..i+4] == [0x50, 0x4b, 0x03, 0x04] {
-                    //             unsafe {
-                    //                 let len = self.buffer_data_index - i;
-                    //                 ptr::copy(self.buffer.as_ptr().add(i),
-                    //                         self.buffer.as_mut_ptr(),
-                    //                         len);
-                    //                 self.buffer_data_index = len;
-                    //                 header_found = true;
-                    //             }
-                    //             // #[cfg(feature = "std")]
-                    //             // println!("found signature at {}", i);
-                    //             break;
-                    //         }
-                    //     }
-
-                    //     save the last 3 bytes if header was not found
-                    //     if header_found == false {
-                    //         unsafe {
-                    //             ptr::copy(
-                    //                 self.buffer.as_ptr().add(self.buffer_data_len() - 3),
-                    //                 self.buffer.as_mut_ptr(),
-                    //                 3,
-                    //             );
-                    //         }
-                    //         self.buffer_data_index = 3;
-                    //         continue;
-                    //     }
-
-                    //     begin to parse if data is ready
-                    //     if self.buffer_data_len() < LOCAL_FILE_HEADER_LEN {
-                    //         continue;
-                    //     }
-                    // }
 
                     // parse header
                     if let Some(file_info) = unsafe {
@@ -1073,7 +1001,7 @@ impl<const N: usize> PassiveParser<N> {
                         self.localfile_info.replace(localfile_info);
 
                         // The data size in buffer must equal to LOCAL_FILE_HEADER_LEN
-                        self.buffer_data_index = 0;
+                        self.buffer.clear();
                     } else {
                         // #[cfg(feature = "std")]
                         // eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", self.buffer);
@@ -1082,7 +1010,7 @@ impl<const N: usize> PassiveParser<N> {
                         let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
 
                         // drop all data
-                        self.buffer_data_index = 0;
+                        self.buffer.clear();
 
                         if res == false {
                             break Err(count);
@@ -1185,27 +1113,27 @@ impl<const N: usize> PassiveParser<N> {
                 ParserState::RecvCentralFileHeader => {
                     if self.central_file_header_len == 0 {
                         let len = cmp::min(
-                            CENTRAL_FILE_HEADER_LEN - self.buffer_data_len(),
+                            CENTRAL_FILE_HEADER_LEN - self.buffer.len(),
                             data.len() - count,
                         );
                         count += self.append_bytes(&data[count..count + len]);
-                        if self.buffer_data_len() < CENTRAL_FILE_HEADER_LEN {
+                        if self.buffer.len() < CENTRAL_FILE_HEADER_LEN {
                             continue;
                         }
 
                         // parse
                         if let Some(header) = unsafe { CentralFileHeader::from_bytes(&self.buffer) } {
                             self.central_file_header_len = header.len();
-                            self.central_file_header_index = self.buffer_data_len();
+                            self.central_file_header_index = self.buffer.len();
 
                             // drop all data
-                            self.buffer_data_index = 0;
+                            self.buffer.clear();
                         } else {
                             let err = ParsingError::InvalidCentralFileHeader;
                             let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
 
                             // drop all data
-                            self.buffer_data_index = 0;
+                            self.buffer.clear();
 
                             if res == false {
                                 break Err(count);
@@ -1230,27 +1158,27 @@ impl<const N: usize> PassiveParser<N> {
                 ParserState::RecvCentralDirEnd => {
                     if self.central_dir_end_len == 0 {
                         let len = cmp::min(
-                            CENTRAL_DIR_END_LEN - self.buffer_data_len(),
+                            CENTRAL_DIR_END_LEN - self.buffer.len(),
                             data.len() - count,
                         );
                         count += self.append_bytes(&data[count..count + len]);
-                        if self.buffer_data_len() < CENTRAL_DIR_END_LEN {
+                        if self.buffer.len() < CENTRAL_DIR_END_LEN {
                             continue;
                         }
 
                         // parse
                         if let Some(header) = unsafe { CentralDirEnd::from_bytes(&self.buffer) } {
                             self.central_dir_end_len = header.len();
-                            self.central_dir_end_index = self.buffer_data_len();
+                            self.central_dir_end_index = self.buffer.len();
 
                             // drop all data
-                            self.buffer_data_index = 0;
+                            self.buffer.clear();
                         } else {
                             let err = ParsingError::InvalidCentralDirEnd;
                             let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
 
                             // drop all data
-                            self.buffer_data_index = 0;
+                            self.buffer.clear();
 
                             if res == false {
                                 break Err(count);
@@ -1293,8 +1221,7 @@ impl<const N: usize> Default for PassiveParser<N> {
             #[cfg(feature = "std")]
             zip_file_comment: Vec::new(),
 
-            buffer: [0; CENTRAL_FILE_HEADER_LEN],
-            buffer_data_index: 0,
+            buffer: Default::default(),
 
             localfile_info: None,
             localfile_index: 0,
@@ -1322,7 +1249,7 @@ impl<const N: usize> Default for PassiveParser<N> {
 pub mod prelude {
     pub use crate::{
         LocalFile, LocalFileOps,
-        Parser, ParsingError, ParserState, ParserEvent, DataStream,
+        Parser, ParsingError, ParserState, ParserEvent,
         SequentialParser, SeekingParser, PassiveParser,
     };
 }
