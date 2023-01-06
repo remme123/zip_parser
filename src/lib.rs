@@ -873,7 +873,7 @@ impl<const N: usize> PassiveParser<N> {
         } else {
             data.len()
         };
-        self.buffer.extend_from_slice(&data[..len]).unwrap();
+        self.buffer.extend_from_slice(&data[..len]).unwrap_or_else(|_| panic!());
         len
     }
 
@@ -1203,7 +1203,7 @@ impl<const N: usize> PassiveParser<N> {
                         }
                     }
                 }
-            };
+            }
         };
 
         // report consumed len
