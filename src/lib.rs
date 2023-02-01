@@ -826,9 +826,16 @@ impl<'a, S: Read, const N: usize> Iterator for SequentialParser<'a, S, N> {
 
 
 #[derive(Debug, Clone, Copy)]
-pub enum ParserState {
-    RecvHeader,
-    RecvLocalFileHeader,
+enum HeaderType {
+    HeaderSignature,
+    LocalFileHeader,
+    CentralFileHeader,
+    CentralDirEnd,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ParserState {
+    RecvHeader(HeaderType, usize),
     RecvCentralFileHeader,
     RecvCentralDirEnd,
     RecvLocalFileName,
@@ -863,10 +870,18 @@ pub struct PassiveParser<const N: usize> {
     central_dir_end_index: usize,
     central_dir_end_len: usize,
 
-    pub state: ParserState,
+    state: ParserState,
 }
 
 impl<const N: usize> PassiveParser<N> {
+    fn buffer_data_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn buffer_data(&self) -> &[u8] {
+        self.buffer.as_slice()
+    }
+
     fn append_bytes(&mut self, data: &[u8]) -> usize {
         let len = if data.len() + self.buffer.len() > self.buffer.capacity() {
             self.buffer.capacity() - self.buffer.len()
@@ -882,7 +897,7 @@ impl<const N: usize> PassiveParser<N> {
     }
 
     pub fn reset(&mut self) {
-        self.state = ParserState::RecvHeader;
+        self.state = ParserState::RecvHeader(HeaderType::HeaderSignature, 4);
 
         #[cfg(feature = "std")]
         { self.zip_file_comment = Vec::new(); }
@@ -924,96 +939,136 @@ impl<const N: usize> PassiveParser<N> {
     where
         F: for<'b, 'c> FnMut(ParserEvent<'b, 'c, N>) -> bool,
     {
-        let mut count = 0;
+        struct BufferData<'a> {
+            count: usize,
+            data: &'a [u8],
+        }
+
+        impl<'a> BufferData<'a> {
+            pub fn new(data: &'a [u8]) -> Self {
+                BufferData {
+                    count: 0,
+                    data,
+                }
+            }
+
+            pub fn peek_data(&self, len: usize) -> &[u8] {
+                &self.data[self.count..self.count + len]
+            }
+
+            /// Processed some data, which length is `len`
+            pub fn proccessed(&mut self, len: usize) {
+                self.count += len;
+            }
+
+            pub fn proccessed_data_len(&self) -> usize {
+                self.count
+            }
+
+            pub fn unproccessed_data_len(&self) -> usize {
+                self.data.len() - self.count
+            }
+        }
+
+        let mut buffer_data = BufferData::new(data);
         let res: Result<usize, usize> = loop {
             // All data have being processed
-            if count >= data.len() {
+            if buffer_data.proccessed_data_len() >= data.len() {
                 break Ok(data.len());
             }
+            let mut continue_parsing = true;
             match self.state {
-                ParserState::RecvHeader => {
+                ParserState::RecvHeader(header_type, header_len) => {
                     // queue data
                     let len = cmp::min(
-                        4 - self.buffer.len(),
-                        data.len() - count,
+                        header_len - self.buffer_data_len(),
+                        buffer_data.unproccessed_data_len(),
                     );
-                    count += self.append_bytes(&data[count..count + len]);
+                    buffer_data.proccessed(self.append_bytes(buffer_data.peek_data(len)));
 
-                    // #[cfg(feature = "std")]
-                    // println!("count:{} data:{:02X?}", count, self.buffer_data());
-
-                    // check signature
-                    if self.buffer.len() < 4 {
+                    // check data len in buffer
+                    if self.buffer_data_len() < header_len {
                         continue;
                     }
 
-                    // parse signature type
-                    match Signature::try_from(self.buffer.as_ref()) {
-                        Err(err) => {
-                            let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
-                            if res == false {
-                                break Err(count);
+                    match header_type {
+                        HeaderType::HeaderSignature => {
+                            // parse signature type
+                            match Signature::try_from(self.buffer.as_ref()) {
+                                Err(err) => {
+                                    continue_parsing = on_event(ParserEvent::ParsingError(self.localfile_index, err));
+                                    self.buffer.clear();
+                                }
+                                Ok(sig) => {
+                                    match sig {
+                                        Signature::LocalFileHeader => self.state = ParserState::RecvHeader(HeaderType::LocalFileHeader, LOCAL_FILE_HEADER_LEN),
+                                        Signature::CentralFileHeader => self.state = ParserState::RecvHeader(HeaderType::CentralFileHeader, CENTRAL_FILE_HEADER_LEN),
+                                        Signature::CentralDirEnd => self.state = ParserState::RecvHeader(HeaderType::CentralDirEnd, CENTRAL_DIR_END_LEN),
+                                    }
+                                }
                             }
                         }
-                        Ok(sig) => {
-                            match sig {
-                                Signature::LocalFileHeader => self.state = ParserState::RecvLocalFileHeader,
-                                Signature::CentralFileHeader => self.state = ParserState::RecvCentralFileHeader,
-                                Signature::CentralDirEnd => self.state = ParserState::RecvCentralDirEnd,
+                        HeaderType::LocalFileHeader => {
+                            // parse header
+                            if let Some(file_info) = unsafe {
+                                LocalFileHeader::from_bytes(&self.buffer)
+                            } {
+                                // #[cfg(feature = "std")]
+                                // dbg!(file_info);
+
+                                // header is ready
+                                self.state = ParserState::RecvLocalFileName;
+
+                                self.file_name_index = 0;
+                                self.file_name_len = file_info.file_name_length as usize;
+                                self.extra_field_index = 0;
+                                self.extra_field_len = file_info.extra_field_length as usize;
+                                self.file_data_index = 0;
+                                self.file_data_len = file_info.compressed_size as usize;
+
+                                // The data size in buffer must equal to LOCAL_FILE_HEADER_LEN
+                                let localfile_info = LocalFileInfo::default()
+                                    .with_compression_method(CompressMethod::from(file_info.compression_method))
+                                    .with_compressed_size(file_info.compressed_size as u64)
+                                    .with_uncompressed_size(file_info.uncompressed_size as u64);
+                                self.localfile_info.replace(localfile_info);
+                            } else {
+                                // #[cfg(feature = "std")]
+                                // eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", self.buffer);
+
+                                let err = ParsingError::InvalidLocalFileHeader;
+                                continue_parsing = on_event(ParserEvent::ParsingError(self.localfile_index, err));
                             }
+                            // drop all data
+                            self.buffer.clear();
                         }
-                    }
-                }
-                ParserState::RecvLocalFileHeader => {
-                    // queue data
-                    let len = cmp::min(
-                        LOCAL_FILE_HEADER_LEN - self.buffer.len(),
-                        data.len() - count,
-                    );
-                    count += self.append_bytes(&data[count..count + len]);
+                        HeaderType::CentralFileHeader => {
+                            // parse
+                            if let Some(header) = unsafe { CentralFileHeader::from_bytes(&self.buffer) } {
+                                self.central_file_header_len = header.len();
+                                self.central_file_header_index = self.buffer_data_len();
+                            } else {
+                                let err = ParsingError::InvalidCentralFileHeader;
+                                continue_parsing = on_event(ParserEvent::ParsingError(self.localfile_index, err));
+                            }
+                            // drop all data
+                            self.buffer.clear();
 
-                    // header is not ready
-                    if self.buffer.len() < LOCAL_FILE_HEADER_LEN {
-                        continue;
-                    }
+                            self.state = ParserState::RecvCentralFileHeader;
+                        }
+                        HeaderType::CentralDirEnd => {
+                            // parse
+                            if let Some(header) = unsafe { CentralDirEnd::from_bytes(&self.buffer) } {
+                                self.central_dir_end_len = header.len();
+                                self.central_dir_end_index = self.buffer_data_len();
+                            } else {
+                                let err = ParsingError::InvalidCentralDirEnd;
+                                continue_parsing = on_event(ParserEvent::ParsingError(self.localfile_index, err));
+                            }
+                            // drop all data
+                            self.buffer.clear();
 
-                    // parse header
-                    if let Some(file_info) = unsafe {
-                        LocalFileHeader::from_bytes(&self.buffer)
-                    } {
-                        // #[cfg(feature = "std")]
-                        // dbg!(file_info);
-
-                        // header is ready
-                        self.state = ParserState::RecvLocalFileName;
-
-                        self.file_name_index = 0;
-                        self.file_name_len = file_info.file_name_length as usize;
-                        self.extra_field_index = 0;
-                        self.extra_field_len = file_info.extra_field_length as usize;
-                        self.file_data_index = 0;
-                        self.file_data_len = file_info.compressed_size as usize;
-
-                        let localfile_info = LocalFileInfo::default()
-                            .with_compression_method(CompressMethod::from(file_info.compression_method))
-                            .with_compressed_size(file_info.compressed_size as u64)
-                            .with_uncompressed_size(file_info.uncompressed_size as u64);
-                        self.localfile_info.replace(localfile_info);
-
-                        // The data size in buffer must equal to LOCAL_FILE_HEADER_LEN
-                        self.buffer.clear();
-                    } else {
-                        // #[cfg(feature = "std")]
-                        // eprintln!("get LocalFileHeader from raw ptr({:02X?}) failed", self.buffer);
-
-                        let err = ParsingError::InvalidLocalFileHeader;
-                        let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
-
-                        // drop all data
-                        self.buffer.clear();
-
-                        if res == false {
-                            break Err(count);
+                            self.state = ParserState::RecvCentralDirEnd;
                         }
                     }
                 }
@@ -1021,18 +1076,16 @@ impl<const N: usize> PassiveParser<N> {
                     // if header is ready
                     if self.localfile_info.is_none() {
                         let err = ParsingError::LocalFileHeaderNotRecved(self.localfile_index);
-                        let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
-                        if res == false {
-                            break Err(count);
+                        if on_event(ParserEvent::ParsingError(self.localfile_index, err)) == false {
+                            break Err(buffer_data.proccessed_data_len());
                         }
                     }
 
                     // check file name len
                     if self.file_name_len > N {
                         let err = ParsingError::LocalFileNameTooLong(self.localfile_index, self.file_name_len as usize);
-                        let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
-                        if res == false {
-                            break Err(count);
+                        if on_event(ParserEvent::ParsingError(self.localfile_index, err)) == false {
+                            break Err(buffer_data.proccessed_data_len());
                         }
                     }
 
@@ -1044,165 +1097,96 @@ impl<const N: usize> PassiveParser<N> {
                     } else {
                         let len = cmp::min(
                             self.file_name_len - self.file_name_index,
-                            data.len() - count,
+                            buffer_data.unproccessed_data_len(),
                         );
                         self.localfile_info.as_mut().unwrap()
                             .file_name_buffer[self.file_name_index..self.file_name_index + len]
                             .as_mut()
-                            .copy_from_slice(&data[count..count + len]);
+                            .copy_from_slice(buffer_data.peek_data(len));
                         self.file_name_index += len;
 
                         // count processed data
-                        count += len;
+                        buffer_data.proccessed(len);
                     }
                 }
                 ParserState::RecvLocalFileExtraField => {
                     if self.extra_field_index >= self.extra_field_len {
-                        let res = on_event(ParserEvent::LocalFileHeader(self.localfile_index, self.localfile_info.as_ref().unwrap()));
+                        continue_parsing = on_event(ParserEvent::LocalFileHeader(self.localfile_index, self.localfile_info.as_ref().unwrap()));
 
                         self.state = ParserState::RecvLocalFileData;
-
-                        if res == false {
-                            break Err(count);
-                        }
                     } else {
                         // fake save
                         let len = cmp::min(
                             self.extra_field_len - self.extra_field_index,
-                            data.len() - count,
+                            buffer_data.unproccessed_data_len(),
                         );
                         self.extra_field_index += len;
 
                         // count processed data
-                        count += len;
+                        buffer_data.proccessed(len);
                     }
                 }
                 ParserState::RecvLocalFileData => {
                     if self.file_data_index >= self.file_data_len {
-                        let res = on_event(ParserEvent::LocalFileEnd(self.localfile_index));
+                        continue_parsing = on_event(ParserEvent::LocalFileEnd(self.localfile_index));
 
                         self.localfile_index += 1;
-                        self.state = ParserState::RecvHeader;
-
-                        if res == false {
-                            break Err(count);
-                        }
+                        self.state = ParserState::RecvHeader(HeaderType::HeaderSignature, 4);
                     } else {
                         // process
                         let len = cmp::min(
                             self.file_data_len - self.file_data_index,
-                            data.len() - count,
+                            buffer_data.unproccessed_data_len(),
                         );
-                        let res = on_event(
+                        continue_parsing = on_event(
                             ParserEvent::LocalFileData{
                                 file_index: self.localfile_index,
                                 offset: self.file_data_index,
-                                data: &data[count..count + len],
+                                data: buffer_data.peek_data(len),
                             }
                         );
                         self.file_data_index += len;
 
                         // count processed data
-                        count += len;
-
-                        if res == false {
-                            break Err(count);
-                        }
+                        buffer_data.proccessed(len);
                     }
                 }
                 ParserState::RecvCentralFileHeader => {
-                    if self.central_file_header_len == 0 {
-                        let len = cmp::min(
-                            CENTRAL_FILE_HEADER_LEN - self.buffer.len(),
-                            data.len() - count,
-                        );
-                        count += self.append_bytes(&data[count..count + len]);
-                        if self.buffer.len() < CENTRAL_FILE_HEADER_LEN {
-                            continue;
-                        }
-
-                        // parse
-                        if let Some(header) = unsafe { CentralFileHeader::from_bytes(&self.buffer) } {
-                            self.central_file_header_len = header.len();
-                            self.central_file_header_index = self.buffer.len();
-
-                            // drop all data
-                            self.buffer.clear();
-                        } else {
-                            let err = ParsingError::InvalidCentralFileHeader;
-                            let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
-
-                            // drop all data
-                            self.buffer.clear();
-
-                            if res == false {
-                                break Err(count);
-                            }
-                        }
+                    if self.central_file_header_index >= self.central_file_header_len {
+                        self.centralfile_index += 1;
+                        self.central_file_header_index = 0;
+                        self.central_file_header_len = 0;
+                        self.state = ParserState::RecvHeader(HeaderType::HeaderSignature, 4);
                     } else {
-                        if self.central_file_header_index >= self.central_file_header_len {
-                            self.centralfile_index += 1;
-                            self.central_file_header_index = 0;
-                            self.central_file_header_len = 0;
-                            self.state = ParserState::RecvHeader;
-                        } else {
-                            let len = cmp::min(
-                                self.central_file_header_len - self.central_file_header_index,
-                                data.len() - count,
-                            );
-                            count += len;
-                            self.central_file_header_index += len;
-                        }
+                        let len = cmp::min(
+                            self.central_file_header_len - self.central_file_header_index,
+                            buffer_data.unproccessed_data_len(),
+                        );
+                        self.central_file_header_index += len;
+                        buffer_data.proccessed(len);
                     }
                 }
                 ParserState::RecvCentralDirEnd => {
-                    if self.central_dir_end_len == 0 {
-                        let len = cmp::min(
-                            CENTRAL_DIR_END_LEN - self.buffer.len(),
-                            data.len() - count,
-                        );
-                        count += self.append_bytes(&data[count..count + len]);
-                        if self.buffer.len() < CENTRAL_DIR_END_LEN {
-                            continue;
-                        }
-
-                        // parse
-                        if let Some(header) = unsafe { CentralDirEnd::from_bytes(&self.buffer) } {
-                            self.central_dir_end_len = header.len();
-                            self.central_dir_end_index = self.buffer.len();
-
-                            // drop all data
-                            self.buffer.clear();
-                        } else {
-                            let err = ParsingError::InvalidCentralDirEnd;
-                            let res = on_event(ParserEvent::ParsingError(self.localfile_index, err));
-
-                            // drop all data
-                            self.buffer.clear();
-
-                            if res == false {
-                                break Err(count);
-                            }
-                        }
+                    if self.central_dir_end_index >= self.central_dir_end_len {
+                        self.central_dir_end_index = 0;
+                        self.central_dir_end_len = 0;
+                        self.state = ParserState::RecvHeader(HeaderType::HeaderSignature, 4);
                     } else {
-                        if self.central_dir_end_index >= self.central_dir_end_len {
-                            self.central_dir_end_index = 0;
-                            self.central_dir_end_len = 0;
-                            self.state = ParserState::RecvHeader;
-                        } else {
-                            let len = cmp::min(
-                                self.central_dir_end_len - self.central_dir_end_index,
-                                data.len() - count,
-                            );
+                        let len = cmp::min(
+                            self.central_dir_end_len - self.central_dir_end_index,
+                            buffer_data.unproccessed_data_len(),
+                        );
 
-                            #[cfg(feature = "std")]
-                            self.zip_file_comment.extend(&data[count..count + len]);
+                        #[cfg(feature = "std")]
+                        self.zip_file_comment.extend(buffer_data.peek_data(len));
 
-                            count += len;
-                            self.central_dir_end_index += len;
-                        }
+                        self.central_dir_end_index += len;
+                        buffer_data.proccessed(len);
                     }
                 }
+            }
+            if continue_parsing == false {
+                break Err(buffer_data.proccessed_data_len());
             }
         };
 
@@ -1216,7 +1200,7 @@ impl<const N: usize> PassiveParser<N> {
 impl<const N: usize> Default for PassiveParser<N> {
     fn default() -> Self {
         Self {
-            state: ParserState::RecvHeader,
+            state: ParserState::RecvHeader(HeaderType::HeaderSignature, 4),
 
             #[cfg(feature = "std")]
             zip_file_comment: Vec::new(),
@@ -1249,7 +1233,7 @@ impl<const N: usize> Default for PassiveParser<N> {
 pub mod prelude {
     pub use crate::{
         LocalFile, LocalFileOps,
-        Parser, ParsingError, ParserState, ParserEvent,
+        Parser, ParsingError, ParserEvent,
         SequentialParser, SeekingParser, PassiveParser,
     };
 }

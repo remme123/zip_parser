@@ -5,31 +5,60 @@ Zip file format parser implemented by rust, supports stream parsing, `no_std` en
 The [`Parser`] will search central directory at the end of zip file if [`Seek`] is available.
 Also, It supports sequence read parsing when [`Seek`] is not available.
 All types in std env implemented `std::io::Read` automatically implement [`Read`], and so is the trait [`Seek`].
+[`PassiveParser`] can be used for some situations in which data is recvieved by other task.
 
 ### stream parsing
 ```rust
-use zip_parser as zip;
-use zip::prelude::*;
-
-#[cfg(feature = "std")]
-fn parse<S: zip::Read + zip::Seek>(parser: Parser<S>) {
-    for (i, mut file) in parser.enumerate() {
-        println!("{}: {}({} Bytes)", i, unsafe { file.file_name() }, file.file_size());
-        let mut buf = Vec::new();
-        buf.resize(file.file_size() as usize, 0);
-        if let Ok(n) = file.read(&mut buf) {
-            println!("Data: {:02X?}", &buf[..n]);
-        } else {
-            println!("read failed");
-        }
-        println!();
-    }
+#[derive(Debug)]
+struct DataBuffer {
+    index: usize,
+    pub buffer: Vec<u8>,
 }
 
-#[cfg(feature = "std")]
-fn stdin_parsing() {
-    println!("*** get stream from stdin ***");
-    parse(Parser::new(std::io::stdin().lock()))
+fn file_stream_parsing(mut file: File) {
+    println!("*** get stream from file ***");
+    let mut buffer = DataBuffer {
+        index: 0,
+        buffer: Vec::new(),
+    };
+    let file_size = file.read_to_end(&mut buffer.buffer).unwrap_or(0);
+    println!("zip size: {} bytes", file_size);
+
+    println!("SequentialParser:");
+    parse(SequentialParser::<DataBuffer>::new(&mut buffer));
+
+    println!("\n\nPassiveParser:");
+    let mut parser = PassiveParser::<128>::new();
+    parser.feed_data(
+        &buffer.buffer,
+        |evt| {
+            match evt {
+                ParserEvent::LocalFileHeader(file_index, file) => {
+                    println!("#{}: {}({}/{} bytes)",
+                    file_index, file.file_name().unwrap_or("Utf8EncodeErr"),
+                        file.compressed_size, file.uncompressed_size);
+                    true
+                },
+                ParserEvent::ParsingError(_file_index, e) => {
+                    println!("error: {e}");
+                    false
+                },
+                _ => {
+                    // println!("unprocessed event: {evt:?}");
+                    true
+                },
+            }
+        }
+    );
+    println!(r#"zip file comment: "{}""#, parser.file_comment().unwrap())
+}
+
+fn main() {
+    let args: Vec<_> = env::args().collect();
+    if args.len() >= 2 {
+        let file = File::open(args[1].as_str()).unwrap();
+        file_stream_parsing(file);
+    }
 }
 ```
 You just need to pass a stream which implements [`Read`] into the [`Parser::new()`](struct.Parser.html#method.new),
@@ -45,9 +74,10 @@ then you can iterate over it. For more detail, see example `stream_parsing`.
     ```bash
     cat test.zip test.zip | cargo run --features="std" --example stream_parsing
     ```
-1. From file
+2. Stream parsing (Read and PassiveParser) from file
     ```bash
     cargo run --features="std" --example stream_parsing -- test.zip
     ```
-
-License: MIT
+#### Passive parsing
+In example [`stream_parsing`], there is a case for passive parsing:
+read data from a file and [`PassiveParser::feed_data`] to the parser.
